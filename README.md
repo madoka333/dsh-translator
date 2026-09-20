@@ -35,7 +35,65 @@ dsh plugin --profile web add link:<克隆到本地的路径>
 dsh plugin --profile web remove dsh-translator
 ```
 
-## 使用
+## 依赖与版本
+
+**本插件不打包任何依赖**。产物 `lib/client.js` 在运行时只 `require` 三个外部模块（`react`、`react-dom`、`react-dom/client`），其余全是自身内部模块；`lib/index.js` 零外部依赖、零动态 `import()`。这三个 React 模块由 DSH Web 前端的模块表在浏览器里提供，**不从 npm 安装**。
+
+因此**没有需要你安装的依赖**：上面那条 `dsh plugin add` 装完即可用。
+
+### 实测环境（本节版本为实机核对，非推测）
+
+| 组件 | 版本 | 来源 / 说明 |
+|---|---|---|
+| **DSH 本体**（`dsh` CLI） | **`0.1.6-alpha.2`** | 实机 `dsh --version` |
+| DSH 客户端插件（`@deepseek-ai/dsh-client-ui-*` 等） | **`0.1.6-alpha.2`** | 随本体同版本发布，本机共 67 个 |
+| **React / ReactDOM**（本插件唯一的外部模块） | **`18.x`**（前端声明 `^18.2.0`） | 由 `@deepseek-ai/dsh-web-frontend` 打进 shell，浏览器运行时提供 |
+| **`@deepseek-ai/cordis`**（宿主插件运行时，`peerDependencies`） | **`^4.0.2`** | npm 上 `latest = 4.0.2`；与官方 `dsh-client-ui-*` 的声明**逐字一致** |
+| **Node.js**（`engines`） | **`>=22`** | 实测 `v24.15.0` |
+
+### 依赖面清单
+
+```jsonc
+// package.json
+"peerDependencies": {
+  "@deepseek-ai/cordis": "^4.0.2",   // 宿主插件运行时，与官方插件声明一致
+  "react": "^18.2.0"                 // 客户端半边实际 require 的三个模块
+},
+"peerDependenciesMeta": {
+  "@deepseek-ai/cordis": { "optional": true },
+  "react": { "optional": true }      // 由宿主 shell 提供，绝不是 npm 依赖
+},
+"engines": { "node": ">=22" }
+```
+
+> 之所以把两个 peer 都标 `optional`：它们**在安装期都不该被 pnpm 去 npm 上拉取**——`cordis` 由宿主运行时提供，`react` 由浏览器 shell 提供。标成 optional 是为了让 `dsh plugin add` 在任何 profile 里都**静默通过**（实测：全新 profile 安装**零 peer 警告**）。
+
+### 装完会发生什么（已实测）
+
+在全新空 profile 里执行 README 那条命令，实测结果：
+
+```
+dependencies:
++ dsh-translator git+https://github.com/madoka333/dsh-translator.git
+Packages: +1
+Done in 19.2s using pnpm v11.22.0
+```
+
+- 包的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，DSH 会**自动**把插件插进 profile 配置树，**无需手工改 profile**。实测 `dsh --profile web --dump-config` 输出：
+  ```yaml
+  - id: dsh-translator
+    name: dsh-translator
+  ```
+- **没有 `prepare` 脚本**，`lib/` 产物已入库 ⇒ git 来源安装**不会**触发 pnpm 的"构建脚本被拦截"警告，也**不需要**往 `pnpm-workspace.yaml` 加 `allowBuilds`
+- 实测：装完的包内**不含** `node_modules`、`.evidence`、`HANDOVER.md`，产物完整（`lib/client.js` 97,821 B、`lib/index.js` 40,202 B）
+
+### 版本兼容性提示
+
+- **DSH `0.1.x`**：在本节所列版本上实测通过。插件只用公开扩展点（`webServer.register`、`sidebarRight` 座位、`ctx.llm.stream`、`settingsScope`），未依赖内部实现。
+- **DSH `0.2+` 或跨 minor**：座位契约与职责链 API 若变动，可能出现**空白面板**（座位被退位）或「这类内容还没有可用的查看方式。」（座位 key 不匹配）。判读方法见下面 §「已知坑与排查」第 0 条与第 4 条。
+- **Node `< 22`**：`engines` 不满足。构建期（`npm run build`）用到较新的 ESM/正则特性，请用 Node 22+。
+
+
 
 1. 在对话里**划选**想看的英文（≥ 8 个字符）。
 2. 松手后出现「译」胶囊按钮 → 点击。右侧边栏自动展开并切到「翻译」页签，译文逐字出现。
@@ -239,7 +297,7 @@ npm run verify    # build + test + 产物契约校验（含 apply 真挂载、Co
 
 ## 兼容性
 
-- 目标：DSH `0.1.5-rc.2`（本机验证版本），客户端按 `dsh.client.platform = web` 由 DSH 客户端模块图装载。
+- 实测环境：DSH **`0.1.6-alpha.2`**（本机 `dsh --version`），客户端按 `dsh.client.platform = web` 由 DSH 客户端模块图装载。依赖面与各组件版本见上文 §「依赖与版本」。
 - 只用公开扩展点：`slots`、`sidebarRight` / `sidebarRightTabs`（两段式页签注册）、`sessions`、`uiConversation`（`chat` target 的 `legacy` 投影）、`ctx.llm.stream`、`ctx.webServer.register`、`ctx.systemPrompt.section`。
 - 右侧边栏不可用时不会报错：译文退化为一个固定浮层卡片，功能仍可用。
 - 配置校验不走加载器的 schema（见上文），因此插件配置键由本插件自己把关；profile 里写错键会在 `apply()` 阶段抛错。
