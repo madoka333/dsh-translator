@@ -18,13 +18,14 @@ DSH Web GUI 的**划选翻译**插件：在对话里用鼠标划选一段英文�
 ## 安装
 
 ```powershell
+# 一条命令装（推荐）
+dsh plugin --profile web add github:madoka333/dsh-translator
+
 # 本地目录（本机开发方式）
 dsh plugin --profile web add link:<克隆到本地的路径>
-
-# 或从 npm / git 安装
-dsh plugin --profile web add dsh-translator
-dsh plugin --profile web add github:<owner>/dsh-translator
 ```
+
+> ⚠️ **不要**用 `dsh plugin --profile web add dsh-translator`：npm 上的裸名 `dsh-translator` 是**另一个人的包**（维护者 `jannchie`，一个 DeepL 风格的双栏翻译面板），与本项目无关。本项目目前**没有发布到 npm**；将来若发布，会用带 scope 的名字（如 `@madoka333/dsh-translator`）。
 
 然后**重启 `dsh web`**（宿主半边改动必须重启；之后只改客户端半边刷新页面即可）。
 
