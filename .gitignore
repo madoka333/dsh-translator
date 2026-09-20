@@ -1,0 +1,30 @@
+# Dependencies — never published, never committed
+node_modules/
+
+# Local build scratch used by `node build.mjs --stage`
+.build-run/
+
+# Verification evidence from the local headless-browser runs.
+# These files contain ONE-TIME dsh web URLs WITH ACCESS TOKENS and page dumps of a
+# real session (sidebar titles, balances, workspace paths). They are local artefacts,
+# not part of the plugin.
+.evidence/
+
+# Handover notes kept local on purpose: they describe this machine's profile
+# layout and the debugging history, which is not plugin material.
+HANDOVER.md
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.log
+*.tmp
+*~
+
+# Local environment / credentials — must never be committed
+.env
+.env.*
+*.pem
+*.key

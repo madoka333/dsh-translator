@@ -1,0 +1,74 @@
+{
+  "name": "dsh-translator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH Web GUI 划选翻译：鼠标划选对话里的英文（Think 推理、中间步骤正文、任意片段）→ 引用到右侧边栏「翻译」页签 → 官方 LLM 流式出中文译文。纯显示层，译文不写入会话日志、不占上下文。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "verify": "node build.mjs && node --test test/*.test.mjs && node tools/verify-build.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {},
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "translation",
+    "translator",
+    "web-gui",
+    "sidebar"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/madoka333/dsh-translator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/madoka333/dsh-translator/issues"
+  },
+  "homepage": "https://github.com/madoka333/dsh-translator#readme",
+  "author": "madoka333",
+  "license": "MIT"
+}

@@ -1,0 +1,8 @@
+# dsh-translator: local plugin package — a plain package (not a workspace). The
+# build-time esbuild install needs its postinstall (platform binary fetch) to run,
+# so it is allowed here rather than left blocked by pnpm's default policy.
+packages:
+  - .
+
+allowBuilds:
+  esbuild: true

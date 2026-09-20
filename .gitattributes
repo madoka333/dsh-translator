@@ -1,0 +1,20 @@
+# Keep the published tree byte-identical to the working tree on every platform.
+#
+# This machine has `core.autocrlf=true` (Git for Windows default), which would
+# otherwise rewrite every source file to CRLF on checkout. The repo is authored
+# in LF, and `test/client.test.mjs` / `tools/verify-build.mjs` compare code points
+# in the built artefacts — so a silent line-ending rewrite is a real hazard.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending-normalised.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+
+# Windows-only scripts must keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
