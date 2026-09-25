@@ -293,13 +293,46 @@ async function loadClientBundle() {
   return registrations[0]
 }
 
-/** Build the fake client context `apply` receives. */
-function makeContext() {
+/** One observable scope binding source, shaped like `uiSession.adapter.current`. */
+function bindingSource(key) {
+  const listeners = new Set()
+  let value = { key, hooks: {}, keyedHooks: {}, props: {} }
+  return {
+    getSnapshot: () => value,
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    /** Move the binding, notifying like the real adapter does. */
+    set(nextKey) {
+      value = { key: nextKey, hooks: {}, keyedHooks: {}, props: {} }
+      for (const listener of [...listeners]) listener()
+    },
+    get subscriberCount() {
+      return listeners.size
+    },
+  }
+}
+
+/**
+ * Build the fake client context `apply` receives.
+ *
+ * The services are held in one table so a test can withhold any of them: `apply`
+ * now takes EVERY service through `ctx.inject([...], cb)`, and the whole point of
+ * that shape is what happens when one is missing.
+ *
+ * @param options - `{services}`: which services this fake page provides.
+ */
+function makeContext(options = {}) {
   const calls = {
     tabTypes: [],
     slots: [],
     injects: [],
     effects: [],
+    /** One entry per `ctx.inject(deps, cb)` call, in declaration order. */
+    serviceWaits: [],
+    /** The waits whose services are missing — the fibers that would park. */
+    parked: [],
     sessionSubscribes: 0,
   }
   const slots = {
@@ -315,8 +348,10 @@ function makeContext() {
       calls.slots.push({ name: options?.name ?? '(unnamed)', options, component })
       return () => {}
     },
+    snapshot: () => [],
   }
-  const ctx = {
+  const sessionBinding = bindingSource('session-1')
+  const catalogue = {
     // cordis runs the effect factory SYNCHRONOUSLY at registration time and keeps
     // its returned disposer; a fake that merely records the factory would let a
     // plugin that never actually wires anything pass this suite.
@@ -324,7 +359,6 @@ function makeContext() {
       calls.effects.push(factory)
       return factory() ?? (() => {})
     },
-    get: () => undefined,
     slots,
     sidebarRightTabs: {
       register(definition) {
@@ -337,19 +371,45 @@ function makeContext() {
         calls.opened = kind
       },
     },
-    sessions: {
-      list: {
-        getSnapshot: () => ({ current: 'session-1', ids: ['session-1'] }),
-        subscribe: () => {
-          calls.sessionSubscribes += 1
-          return () => {}
-        },
+    uiSession: {
+      adapter: {
+        current: sessionBinding,
       },
     },
-    settingsScope: {},
-    uiConversation: undefined,
   }
-  return { ctx, calls }
+  const present = new Set(options.services ?? ['slots', 'sidebarRight', 'sidebarRightTabs', 'uiSession'])
+  const services = Object.fromEntries(Object.entries(catalogue).filter(([name]) => present.has(name)))
+  const ctx = {
+    ...services,
+    effect: catalogue.effect,
+    /**
+     * Read one service without a dependency declaration (how `apply` reads the
+     * optional ones).
+     * @param name - service name.
+     * @returns the service, or undefined when this page does not provide it.
+     */
+    get: (name) => services[name],
+    /**
+     * cordis' child-fiber shorthand. A real one waits for its services and
+     * activates the callback when they appear; here the callback runs immediately
+     * when they are all present and the wait is recorded as PARKED when they are
+     * not — which is the state that must never take the page down.
+     * @param deps - required service names.
+     * @param callback - the child plugin body.
+     */
+    inject(deps, callback) {
+      const list = [...deps]
+      const missing = list.filter((name) => services[name] === undefined)
+      calls.serviceWaits.push({ deps: list, missing })
+      if (missing.length > 0) {
+        calls.parked.push({ deps: list, missing })
+        return () => {}
+      }
+      callback(ctx)
+      return () => {}
+    },
+  }
+  return { ctx, calls, services, sessionBinding }
 }
 
 /**
@@ -404,12 +464,12 @@ function assertRenderable(node, path = 'root') {
 }
 
 /** Everything a single bundle load + mount needs. */
-async function mount() {
+async function mount(options = {}) {
   installFakeDom()
   const registration = await loadClientBundle()
   const createElement = makeReactStub()
   let rootRender
-  const { ctx, calls } = makeContext()
+  const { ctx, calls, services, sessionBinding } = makeContext(options)
   const exports = registration.factory((specifier) => {
     // The bundle destructures hooks from `react`, so the stub must expose them as
     // named exports on the module object — not only as properties of createElement.
@@ -429,13 +489,60 @@ async function mount() {
   })
   assert.equal(registration.id, 'dsh-translator')
   exports.apply(ctx)
-  return { exports, ctx, calls, get rootRender() { return rootRender } }
-}
-test('the bundle declares the services the browser half needs', async () => {
-  const { exports } = await mount()
-  for (const service of ['slots', 'sidebarRight', 'sidebarRightTabs', 'sessions', 'uiConversation', 'settingsScope']) {
-    assert.ok(exports.inject.includes(service), `must inject the ${service} service`)
+  return {
+    exports,
+    ctx,
+    calls,
+    services,
+    sessionBinding,
+    get rootRender() {
+      return rootRender
+    },
   }
+}
+// ---------------------------------------------------------------------------
+// Activation model (DSH 0.1.7-rc.2): a client loader entry that stays PENDING
+// makes `web boot` throw, so a plugin that lists a service dsh has renamed does
+// not lose that service — it takes the entire Web GUI down with it. This plugin
+// therefore declares NO hard service dependency and waits for each capability in
+// its own child fiber.
+// ---------------------------------------------------------------------------
+
+test('the bundle hard-requires no service, and names each capability separately', async () => {
+  const { exports } = await mount()
+  assert.deepEqual(exports.inject, [], 'a hard inject list is a loaded gun pointed at web boot')
+  assert.deepEqual(exports.SIDEBAR_SERVICES, ['slots', 'sidebarRight', 'sidebarRightTabs'])
+  assert.deepEqual(exports.SETTINGS_SERVICES, ['slots'])
+  assert.equal(exports.SESSION_SCOPE_SERVICE, 'uiSession')
+})
+
+test('apply waits for each capability in its own child fiber, not in inject', async () => {
+  const { calls } = await mount()
+  assert.deepEqual(
+    calls.serviceWaits.map((wait) => wait.deps),
+    [['uiSession'], ['slots', 'sidebarRight', 'sidebarRightTabs'], ['slots']],
+    'each capability is gated on exactly the services it uses',
+  )
+  assert.deepEqual(calls.parked, [], 'with every service present nothing parks')
+})
+
+test('a missing service parks one capability and never blocks the boot', async () => {
+  // Nothing this plugin wants exists — the 0.1.7-rc.2 accident, minus the
+  // app-wide outage it used to cause. `mount` runs `apply` for real, so reaching
+  // the next line at all IS the assertion: this call used to throw and leave the
+  // page stuck on the HARNESS boot screen.
+  const { calls } = await mount({ services: [] })
+  assert.deepEqual(
+    calls.parked.map((wait) => wait.deps),
+    [['uiSession'], ['slots', 'sidebarRight', 'sidebarRightTabs'], ['slots']],
+    'every capability parks on its own instead of taking the composition down',
+  )
+  assert.equal(calls.tabTypes.length, 0, 'no tab type without the sidebar registry')
+  assert.equal(calls.slots.length, 0, 'no seats without a slot registry')
+  assert.equal(calls.injects.length, 0, 'no slot wait without a slot service')
+  // The half that needs no service at all is still live.
+  assert.ok(globalThis.window.__listeners.includes('keydown'), 'the shortcut survives')
+  assert.ok(calls.effects.length >= 4, `the watcher and both portal roots stay wired (got ${calls.effects.length})`)
 })
 
 test('apply mounts the sidebar tab type, both tab seats, and the settings row', async () => {
@@ -447,6 +554,11 @@ test('apply mounts the sidebar tab type, both tab seats, and the settings row', 
   assert.equal(definition.title(), '翻译')
   assert.ok(Array.isArray(definition.guide) && definition.guide.length === 1)
   assert.equal(definition.guide[0].title(), '翻译')
+  // `guide[].id` became required in 0.1.7: ui-sidebar-right throws
+  // "duplicate guide entry id" when two providers collide, and two ABSENT ids
+  // collide with each other. An id is therefore not cosmetic.
+  assert.equal(definition.guide[0].id, definition.id, 'each guide entry needs its own stable id')
+  assert.equal(typeof definition.guide[0].order, 'number')
 
   // ui-sidebar-right dispatches both seats with `entryKey: definition.id ?? tab.kind`
   // (TabSlot). The seats MUST therefore key on the definition id — keying them on
@@ -474,21 +586,40 @@ test('apply mounts the sidebar tab type, both tab seats, and the settings row', 
 })
 
 test('apply installs the selection listener, the shortcut, and the session scope', async () => {
-  const { calls } = await mount()
+  const { calls, sessionBinding } = await mount()
   assert.ok(calls.effects.length >= 5, `expected the effect list to be wired, got ${calls.effects.length}`)
   assert.ok(globalThis.window.__listeners.includes('keydown'), 'the shortcut listener must be attached')
   assert.ok(globalThis.document, 'a document must exist for the portal roots')
-  assert.equal(calls.sessionSubscribes, 1, 'the session scope must be subscribed')
+  // The store follows the Session on screen through the scope adapter, so the
+  // subscription is the proof that per-Session namespacing is live.
+  assert.equal(sessionBinding.subscriberCount, 1, 'the scope adapter must be subscribed')
 })
 
-test('apply survives a missing right sidebar and still registers its seats', async () => {
+test('scopeSessionKey reads the Session off the scope adapter, not the old list field', async () => {
+  const { exports, ctx, sessionBinding } = await mount()
+  // 0.1.7 removed `current` from the Session list snapshot entirely
+  // (`ids` / `byId` / `phase` only), which is why the old read silently pinned
+  // every reference list to the "default" bucket.
+  assert.equal(exports.scopeSessionKey(ctx), 'session-1')
+  sessionBinding.set('session-2')
+  assert.equal(exports.scopeSessionKey(ctx), 'session-2')
+  // Nothing selected: the adapter publishes an ABSENT binding whose key is
+  // undefined, and the store degrades to the shared bucket instead of crashing.
+  sessionBinding.set(undefined)
+  assert.equal(exports.scopeSessionKey(ctx), undefined)
+  assert.equal(exports.sessionKeyOf(ctx), 'default')
+  assert.equal(exports.sessionKeyOf({ get: () => undefined }), 'default', 'a service-less page still resolves')
+})
+
+test('a sidebar that refuses its tab type degrades to the floating card', async () => {
   installFakeDom()
   const registration = await loadClientBundle()
   const createElement = makeReactStub()
   const { ctx, calls } = makeContext()
-  // No right sidebar in this deployment: `openTab` will throw at click time (the
-  // pane registration itself never runs), and the plugin must still mount so the
-  // selection → floating-card path stays alive.
+  // No right sidebar in this deployment: `openTab` will throw at click time and
+  // the tab-type registration itself cannot succeed. Neither may escape `apply` —
+  // at boot that is the whole Web GUI, and afterwards it is a dead click with no
+  // explanation.
   ctx.sidebarRightTabs = {
     register() {
       // Simulates the sidebar package not being part of this composition.
@@ -500,17 +631,65 @@ test('apply survives a missing right sidebar and still registers its seats', asy
       throw new Error('no right sidebar mounted')
     },
   }
+  let rootRender
   const exports = registration.factory((specifier) => {
     if (specifier === 'react') return makeReactModule(createElement)
     if (specifier === 'react-dom') return { createPortal: (node) => node }
-    if (specifier === 'react-dom/client') return { createRoot: () => ({ render() {}, unmount() {} }) }
+    if (specifier === 'react-dom/client') {
+      return {
+        createRoot: () => ({
+          render(node) {
+            rootRender = node
+          },
+          unmount() {},
+        }),
+      }
+    }
     throw new Error(`unexpected external require: ${specifier}`)
   })
-  // The tab-type registration is the one step that cannot work without the
-  // sidebar, so it is allowed to fail loudly — but nothing before it may.
-  assert.throws(() => exports.apply(ctx), /sidebar registry unavailable/)
-  // The seats registered earlier in `apply` must still be there.
-  assert.ok(calls.effects.length >= 2, 'roots and watcher mount before the tab type')
+  assert.doesNotThrow(() => exports.apply(ctx), 'a broken sidebar must never escape apply')
+  assert.equal(calls.tabTypes.length, 0, 'the registration really did fail')
+  // The selection → floating-card path is what is left, so it must be what the
+  // user gets, with the reason printed in the card.
+  const text = renderText(rootRender)
+  assert.ok(text.includes('右侧边栏不可用'), `the fallback card explains itself (got: ${text.slice(0, 200)})`)
+  assert.ok(text.includes('sidebar registry unavailable'), 'and names the real cause')
+})
+
+// ---------------------------------------------------------------------------
+// Session namespacing: one reference list per Session. The seat is a
+// `session`-scoped slot, so the Session arrives as a flat `sessionId` prop and the
+// pane re-scopes the store itself — no service call, nothing to wait for.
+// ---------------------------------------------------------------------------
+
+test('the pane re-scopes the store to the Session it is seated in', async () => {
+  const { exports } = await mount()
+  const { RefsStore } = await import('../src/client/stores.js')
+  const runtime = {
+    addRef: () => {},
+    retry: () => {},
+    cancel: () => {},
+    remove: () => {},
+    clear: () => {},
+    setLanguage: () => {},
+    language: 'zh-CN',
+    shortcut: 'Ctrl+Shift+T',
+  }
+
+  const store = new RefsStore('session-1')
+  capturedEffects.length = 0
+  assertRenderable(exports.TranslatePaneExport({ store, runtime, sessionKey: 'session-2' }))
+  assert.equal(store.sessionKey(), 'session-1', 'the switch belongs to the effect, not to the render')
+  assert.ok(capturedEffects.length > 0, 'the pane must have registered its effects')
+  for (const effect of capturedEffects) effect()
+  assert.equal(store.sessionKey(), 'session-2', 'the seat re-scopes the store to its own Session')
+
+  // A store with no `setSession` (the harness above, a foreign host) is left alone
+  // rather than taking the pane's render down.
+  capturedEffects.length = 0
+  const bare = { getSnapshot: () => ({ refs: [], active: null }), subscribe: () => () => {} }
+  assertRenderable(exports.TranslatePaneExport({ store: bare, runtime, sessionKey: 'session-3' }))
+  for (const effect of capturedEffects) effect()
 })
 
 test('the mounted tree is renderable and carries no undefined props', async () => {
@@ -1046,10 +1225,32 @@ test('the self-report is off unless asked for, and reports the wiring when it is
   const { exports, ctx } = await mount()
   assert.equal(exports.debugRequested(), false, 'no report without ?dsht-debug=1')
 
-  // Ask for it and re-mount: the report renders into a portal root of its own.
+  // Ask for it and re-mount: apply now both logs the report and renders the panel.
   globalThis.location = { search: '?token=abc&dsht-debug=1' }
-  const second = await mount()
+  const logged = []
+  const originalLog = console.log
+  console.log = (...args) => logged.push(args.map(String).join(' '))
+  let second
+  try {
+    second = await mount()
+  } finally {
+    console.log = originalLog
+  }
   assert.equal(second.exports.debugRequested(), true, 'the flag is read from the query string')
+
+  // The two lines this release changed. They are asserted because a debug surface
+  // that reports the WRONG thing is worse than no debug surface: the old code read
+  // a `snapshot().occupants` that no longer exists and a `sessions.list.current`
+  // that never existed in this shape, so both lines lied quietly.
+  const report = logged.join('\n')
+  assert.ok(
+    report.includes('session       : session-1（来源: uiSession）'),
+    `the report names the Session namespace and its source (got: ${report.slice(0, 600)})`,
+  )
+  assert.ok(
+    report.includes('hard deps     : 无'),
+    `the report states that no service is hard-required (got: ${report.slice(0, 600)})`,
+  )
 
   // The report panel is a plain component: render it with the same lines the
   // plugin produced and assert the shape the screenshot depends on.
@@ -1067,4 +1268,32 @@ test('the self-report is off unless asked for, and reports the wiring when it is
   }
   assert.equal(panel.props['data-dsh-translator-debug'], '1', 'the panel is marked for debugging')
   void ctx
+})
+
+test('describeSlot reads the 0.1.7 snapshot shape (an array of composition nodes)', async () => {
+  const { exports } = await mount()
+  // Before 0.1.7 `snapshot(key)` answered with one node carrying `declaredBy` and
+  // `occupants`; it is now `LiveCompositionNode[]`. Reading the old shape produced
+  // a permanently empty line, so the shape is pinned here.
+  const slots = {
+    snapshot: () => [
+      { type: 'slot', name: 'other.slot', declaredBy: 'x', occupants: [] },
+      {
+        type: 'slot',
+        name: 'sidebar.right.pane.tab',
+        declaredBy: 'ui-sidebar-right',
+        occupants: [
+          { key: 'dsh-translator', active: true },
+          { key: 'dsh-better-sidebar:files', active: false },
+        ],
+      },
+    ],
+  }
+  const line = exports.describeSlot(slots, 'sidebar.right.pane.tab')
+  assert.ok(line.includes('declaredBy=ui-sidebar-right'), line)
+  assert.ok(line.includes('dsh-translator'), line)
+  assert.ok(line.includes('dsh-better-sidebar:files(inactive)'), line)
+  assert.ok(!line.includes('other.slot'), 'the matching node is selected, not the first one')
+  assert.equal(exports.describeSlot(undefined, 'x'), '（无快照 API）')
+  assert.equal(exports.describeSlot({ snapshot: () => [] }, 'x'), '（该槽位未声明）')
 })

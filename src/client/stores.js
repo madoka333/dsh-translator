@@ -152,6 +152,15 @@ export class RefsStore extends Observable {
     this.commit({ refs: refs.slice(0, MAX_REFS), active: refs[0]?.key ?? null })
   }
 
+  /**
+   * @returns the storage namespace this store is scoped to — the Session id, or
+   * `'default'` while no Session is resolvable. Read back by the provenance lookup
+   * (one chat snapshot per Session) and by the self-report.
+   */
+  sessionKey() {
+    return this.#sessionKey
+  }
+
   /** @returns the current references, newest first. */
   list() {
     return this.getSnapshot().refs

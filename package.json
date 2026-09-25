@@ -20,7 +20,8 @@
   "scripts": {
     "build": "node build.mjs",
     "test": "node --test test/*.test.mjs",
-    "verify": "node build.mjs && node --test test/*.test.mjs && node tools/verify-build.mjs"
+    "verify": "node build.mjs && node --test test/*.test.mjs && node tools/verify-build.mjs",
+    "compat": "node tools/check-dsh-compat.mjs"
   },
   "dsh": {
     "bundle": {
@@ -37,10 +38,12 @@
     }
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": ">=0.1.6-0 <0.2.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh": ">=0.1.6-0 <0.2.0",
     "react": "^18.2.0"
   },
   "peerDependenciesMeta": {

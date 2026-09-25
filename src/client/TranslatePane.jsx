@@ -224,7 +224,13 @@ function RefCard({ item, onRetry, onRemove, onCancel, onCopy }) {
 
 /**
  * @param props - `{store, runtime, sessionKey}` where `runtime` is
- * `{addRef, retry, cancel, remove, clear, setLanguage, language}`.
+ * `{addRef, retry, cancel, remove, clear, setLanguage, language}` and
+ * `sessionKey` is the Session the pane is seated in.
+ *
+ * `sessionKey` arrives as the slot's own `sessionId` prop: `sidebar.right.pane.tab`
+ * is a `session`-scoped keyed slot, so the framework resolves it and no service
+ * call is needed. Switching Sessions re-renders the seat with a new value, which is
+ * what keeps one Session's references out of another's list.
  */
 export function TranslatePane({ store, runtime, sessionKey }) {
   // The snapshot is read through a guarded helper: this line runs INSIDE the hook
@@ -233,6 +239,22 @@ export function TranslatePane({ store, runtime, sessionKey }) {
   const { snapshot, failure: readFailure } = useSafeSnapshot(store)
   const [dragover, setDragover] = useState(false)
   const [notice, setNotice] = useState('')
+
+  // Re-scope the store to the Session this seat belongs to. Declared AFTER
+  // `useSafeSnapshot` so the subscription is live before the switch commits, and
+  // deliberately not in the snapshot read itself: a store whose `setSession`
+  // throws must not take the pane's first render down with it. A store without
+  // `setSession` (the test harness, a foreign host) is simply left alone.
+  useEffect(() => {
+    if (typeof sessionKey !== 'string' || sessionKey === '') return
+    try {
+      store?.setSession?.(sessionKey)
+    } catch (error) {
+      recordRenderFailure(error)
+      console.warn('[dsh-translator] 切换会话命名空间失败:', error)
+    }
+  }, [store, sessionKey])
+
   const refs = snapshot.refs
 
   const flash = useCallback((message) => {

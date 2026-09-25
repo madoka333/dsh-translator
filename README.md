@@ -13,7 +13,7 @@ DSH Web GUI 的**划选翻译**插件：在对话里用鼠标划选一段英文�
 >
 > **第三方代码**：本仓库不包含也不再分发任何第三方源码。产物 `lib/client.js` / `lib/index.js` 均为本仓库自有实现；`react`、`react-dom` 等依赖在运行时从宿主 DSH 的模块表按需加载，不随本包分发。
 >
-> **动手改交互前先读 §「已知坑与排查」**：那里按症状记录了 6 个已经踩过、且回归测试正在守着的坑（座位 key 必须用定义 `id` / capture 阶段 `mousedown` 会吃掉自己的 click / 重试计数器与请求函数同名 / 空白面板=渲染抛错被退位 / hooks 阶段抛错拦不住 / 数据 prop 不能叫 `ref`），以及 `?dsht-debug=1` 两块诊断面板的判读表。
+> **动手改交互前先读 §「已知坑与排查」**：那里按症状记录了 7 个已经踩过、且回归测试正在守着的坑（**任何 client entry 停在 pending 会让整个 Web UI 起不来** / 座位 key 必须用定义 `id` / capture 阶段 `mousedown` 会吃掉自己的 click / 重试计数器与请求函数同名 / 空白面板=渲染抛错被退位 / hooks 阶段抛错拦不住 / 数据 prop 不能叫 `ref`），以及 `?dsht-debug=1` 两块诊断面板的判读表。
 
 ## 安装
 
@@ -45,10 +45,11 @@ dsh plugin --profile web remove dsh-translator
 
 | 组件 | 版本 | 来源 / 说明 |
 |---|---|---|
-| **DSH 本体**（`dsh` CLI） | **`0.1.6-alpha.2`** | 实机 `dsh --version` |
-| DSH 客户端插件（`@deepseek-ai/dsh-client-ui-*` 等） | **`0.1.6-alpha.2`** | 随本体同版本发布，本机共 67 个 |
+| **DSH 本体**（`dsh` CLI） | **`0.1.7-rc.2`** | 实机 `dsh --version`；端到端跑通（见下） |
+| DSH 客户端插件（`@deepseek-ai/dsh-client-ui-*` 等） | **`0.1.7-rc.2`** | 随本体同版本发布 |
 | **React / ReactDOM**（本插件唯一的外部模块） | **`18.x`**（前端声明 `^18.2.0`） | 由 `@deepseek-ai/dsh-web-frontend` 打进 shell，浏览器运行时提供 |
 | **`@deepseek-ai/cordis`**（宿主插件运行时，`peerDependencies`） | **`^4.0.2`** | npm 上 `latest = 4.0.2`；与官方 `dsh-client-ui-*` 的声明**逐字一致** |
+| **`@deepseek-ai/dsh`**（`peerDependencies`，**版本闸门**） | **`>=0.1.6-0 <0.2.0`** | DSH 的 `evaluatePluginCompatibility` 只认这个前缀；越界时**跳过整个 bundle 并报错**，而不是让插件去把 GUI 弄崩 |
 | **Node.js**（`engines`） | **`>=22`** | 实测 `v24.15.0` |
 
 ### 依赖面清单
@@ -57,16 +58,19 @@ dsh plugin --profile web remove dsh-translator
 // package.json
 "peerDependencies": {
   "@deepseek-ai/cordis": "^4.0.2",   // 宿主插件运行时，与官方插件声明一致
+  "@deepseek-ai/dsh": ">=0.1.6-0 <0.2.0",  // 版本闸门，见下
   "react": "^18.2.0"                 // 客户端半边实际 require 的三个模块
 },
 "peerDependenciesMeta": {
   "@deepseek-ai/cordis": { "optional": true },
   "react": { "optional": true }      // 由宿主 shell 提供，绝不是 npm 依赖
 },
-"engines": { "node": ">=22" }
+"engines": { "node": ">=22", "dsh": ">=0.1.6-0 <0.2.0" }
 ```
 
-> 之所以把两个 peer 都标 `optional`：它们**在安装期都不该被 pnpm 去 npm 上拉取**——`cordis` 由宿主运行时提供，`react` 由浏览器 shell 提供。标成 optional 是为了让 `dsh plugin add` 在任何 profile 里都**静默通过**（实测：全新 profile 安装**零 peer 警告**）。
+> 之所以把 `cordis` / `react` 两个 peer 标 `optional`：它们**在安装期都不该被 pnpm 去 npm 上拉取**——`cordis` 由宿主运行时提供，`react` 由浏览器 shell 提供。标成 optional 是为了让 `dsh plugin add` 在任何 profile 里都**静默通过**（实测：全新 profile 安装**零 peer 警告**）。
+>
+> **`@deepseek-ai/dsh` 故意不标 optional。** DSH 启动时会用 `peerDependencies` 里所有 `@deepseek-ai/dsh*` 项去比对运行时版本，**不满足就跳过这个 bundle 并打印原因**（实测：`dsh: skipping profile bundle "dsh-translator": Error: Plugin dsh-translator@0.1.0 is incompatible with dsh 0.1.7-rc.2 …`）。这是**故意要的**：将来 DSH 跨到 `0.2` 时，你要的是"插件被明确拒绝加载 + 一条说清原因的消息"，而不是"插件把整个 Web UI 卡在开机画面"。想强行放行用 `dsh plugin allow-version`（DSH 官方逃生门）。
 
 ### 装完会发生什么（已实测）
 
@@ -89,9 +93,17 @@ Done in 19.2s using pnpm v11.22.0
 
 ### 版本兼容性提示
 
-- **DSH `0.1.x`**：在本节所列版本上实测通过。插件只用公开扩展点（`webServer.register`、`sidebarRight` 座位、`ctx.llm.stream`、`settingsScope`），未依赖内部实现。
-- **DSH `0.2+` 或跨 minor**：座位契约与职责链 API 若变动，可能出现**空白面板**（座位被退位）或「这类内容还没有可用的查看方式。」（座位 key 不匹配）。判读方法见下面 §「已知坑与排查」第 0 条与第 4 条。
+- **DSH `0.1.7-rc.2`**：本版适配并端到端实测通过（划选 → 译 → 右侧栏出中文译文，0 报错；引用列表按 Session 命名空间落盘）。插件只用公开扩展点（`webServer.register` / `tapIndex`、`sidebarRight` 座位、`sidebarRightTabs.register`、`settings.general.item`、`ctx.llm.stream`、`uiSession.adapter.current`）。
+- **DSH `0.1.6-*`**：仍可用。0.1.6 没有 `uiSession.adapter`，会话命名空间会退回 `default`（多会话共用一份引用列表），其余功能不受影响——因为取服务失败只会让那一项能力停摆。
+- **DSH `0.2+`**：`peerDependencies["@deepseek-ai/dsh"]` 不满足 ⇒ **DSH 会在启动时明确拒绝加载本插件**（不会把 GUI 弄崩）。升级前先跑 `npm run compat`。
+- **某次 DSH 升级后整个 Web UI 卡在 `Failed to load plugins`**：这是 DSH 客户端启动的判定方式导致的（任何一个 client entry 不是 active 就抛），排查入口见 §「已知坑与排查」0；预防手段是 `npm run compat`。
 - **Node `< 22`**：`engines` 不满足。构建期（`npm run build`）用到较新的 ESM/正则特性，请用 Node 22+。
+- **升级 DSH 后的三步**（顺序别换）：
+  ```powershell
+  npm run compat     # 1) 离线静态核对：本插件绑定的服务/槽位在新 DSH 里还在不在
+  npm run verify     # 2) 重建 + 86 个测试 + 产物契约
+  node tools\cdp-boot-probe.mjs   # 3) 真浏览器：页面还起不起得来（需 9222 上的 headless Chrome）
+  ```
 
 
 
@@ -117,11 +129,56 @@ Done in 19.2s using pnpm v11.22.0
 - **代码不送翻译**：命令行、路径、URL、行内参数与围栏代码块会被替换成 `⟪code⟫` 占位符，模型看到的是占位符，显示时原位还原成原文。
 - **长文本分批**：超过约 400 字的引用按段落/句子切成多段串行翻译，按序拼接。
 - **失败降级**：认证/额度/超时/空回答都会在卡片上显示错误码与原因，可单独重试；联网失败会自动退避重试 2 次（仅在尚无译文时）。
-- **每会话独立**：引用列表按 Session 存在浏览器本地，切换会话各自一份，刷新页面后仍在。
+- **每会话独立**：引用列表按 Session 存在浏览器本地（`dsh-translator:refs:<sessionId>`），切换会话各自一份，刷新页面后仍在。当前会话是**从座位自己的 `sessionId` prop 与 `uiSession.adapter.current` 拿的**——DSH 0.1.7 把 `current` 从 `sessions.list` 快照里删掉了，旧写法会让所有会话共用名为 `default` 的那一份。
 
 ## 已知坑与排查（改交互前先读）
 
-### 0. 侧边栏座位必须按定义 `id` 注册，不是按 `kind`
+### 0. 任何 client entry 停在 pending，整个 Web UI 就起不来（0.1.7 的 `settingsScope` 事故）
+
+这是**启动级**的规矩，比下面所有条都重要，因为它坏的不是本插件而是整个 dsh。
+
+DSH 的 Web 前端启动时会遍历**每一个 client loader entry**，只要有一个不是 `active` 就抛：
+
+```js
+// dsh-web-frontend（压缩产物，语义如此）
+if (o.length > 0) throw new Error(`web boot: ${o.length} entries did not activate\n${o.join('\n')}`)
+```
+
+而 `pending (waiting for service: X)` **也算 not active**。于是"某个插件在 `inject` 里声明了一个新版 dsh 已经改名的服务"这件事的代价是：
+
+```
+HARNESS
+Failed to load plugins
+web boot: 1 entry did not activate
+dsh-translator: pending (waiting for service: <被删掉的服务名>)
+```
+
+页面**只**剩这块开机画面——没有输入框、没有侧栏，主应用压根没挂载。**一个可选插件能把整个 GUI 拉黑。**
+
+真事：DSH `0.1.6-alpha.2 → 0.1.7-rc.2` 重写了设置接缝，客户端侧的 `settingsScope` 服务被整个删掉。本插件的浏览器半边当时在 `inject` 里列着 `settingsScope`（虽然代码从来没调过它），于是升级当天整个 Web UI 起不来。
+
+**本插件的对策（三层，缺一不可）**：
+
+| 层 | 做法 | 在防什么 |
+|---|---|---|
+| 声明 | `export const inject = []` —— **一个硬依赖都不声明** | 服务改名再也不会让本插件 pending |
+| 取用 | 每项能力各自 `ctx.inject([...服务], cb)` 开**子 fiber**；服务缺失只让那项能力停摆 | 子 fiber 不是 loader entry，`web boot` 的检查看不到它 |
+| 兜底 | 所有服务都用 `ctx.get(name)` 读，读不到就降级（面板 → 浮层卡片） | `apply` 必须在"什么都没有"的页面里也跑完 |
+
+**实测证据**（`tools/cdp-boot-probe.mjs`，真 Chrome）：
+
+| 场景 | 结果 |
+|---|---|
+| 故意在**子 fiber** 里声明一个不存在的服务 | 页面**正常挂载**（输入框在、应用在），那项能力静默停摆 |
+| 同一个不存在的服务放在**顶层 `inject`** | `web boot: 1 entry did not activate` —— 页面卡死在开机画面（复现事故） |
+
+后者是对照组：它证明前者不是"探针没生效"，而是**子 fiber 确实不在 dsh 的启动判定范围里**。
+
+**升级 dsh 后的纪律**：先 `npm run compat`（离线静态核对本插件绑定的服务/槽位在新 dsh 里还在不在），再 `npm run verify`，最后 `node tools\cdp-boot-probe.mjs` 真浏览器确认页面起得来。三步的顺序别换。
+
+> 另注：这条只在**客户端**成立。宿主侧同样是 pending 的 entry，`dsh-app-boot` 只当**警告**处理（`activationDiagnostic`），不影响启动策略。
+
+### 1. 侧边栏座位必须按定义 `id` 注册，不是按 `kind`
 
 症状最好认：**点了「译」、侧边栏展开了，但面板位置显示的是那句兜底文案「这类内容还没有可用的查看方式。」**（英文 `tab.unavailable`）。
 
@@ -142,7 +199,7 @@ entryKey: definition?.id ?? tab.kind,   // 派发时用的 key
 
 回归测试断言的是不变量本身——`seatKeys` 必须等于**注册时那个 definition 的 `id`**，并且顺带断言 `kind !== id`，免得以后有人把两者合并又踩回来。
 
-### 1. 不要在 capture 阶段的 `mousedown` 里抹掉自己的按钮
+### 2. 不要在 capture 阶段的 `mousedown` 里抹掉自己的按钮
 
 浮标按钮曾经**一点就"没反应"**。原因不是没绑定 `click`，而是事件的先后顺序：`document` 上捕获阶段的 `mousedown` 先把候选清空并重渲染，按钮在 `mousedown` 阶段就被卸载，浏览器于是不再向它派发 `click` —— 按钮看上去"点不动"。
 
@@ -150,7 +207,7 @@ entryKey: definition?.id ?? tab.kind,   // 派发时用的 key
 
 配套：浮标的位置在**渲染期**算（`pillAnchorFor`，纯函数、只读视口尺寸），不放 `useEffect`。放 effect 会让首帧返回 `null`，任何需要拿到按钮元素的消费者都得等第二次渲染。
 
-### 2. 传输层：重试循环的计数器不能和请求函数同名
+### 3. 传输层：重试循环的计数器不能和请求函数同名
 
 更狠的一次故障：**侧边栏打开了、卡片一直在"翻译中…"、连一个网络请求都没发出去**。
 
@@ -167,10 +224,10 @@ async function attempt(request) { await fetch(…) }
 
 **规则**：重试循环的索引叫 `tryIndex`，请求函数叫 `attemptOnce`（`src/client/query.js`），两个名字两个职责。真正的防线是测试：`translate() reaches fetch, consumes the stream, and returns the answer` **用真 `translateExport` 打一个 stubbed `fetch`**，断言"恰好一次请求 + 每个 delta 都按序转发 + 结果正确"。任何只在函数内部发生、不会碰网络的错误（名字遮蔽、`this` 丢失、早期 `return`）都只有这种测试抓得到——用假 translator 的 store 测试永远抓不到。
 
-### 3. 排查"点了没反应 / 卡在翻译中"
+### 4. 排查"点了没反应 / 卡在翻译中"
 
 1. 浏览器控制台看 `[dsh-translator]` 前缀的行：`sidebarRight` 不可用、内容无需翻译、渲染失败都会打日志；`TypeError` 之类也会以红字出现（就是第 2 类）。
-2. 用 `Ctrl+Shift+T` 走同一条 `commitSelection`：快捷键正常而按钮异常 → 属于第 1 类事件竞态；两者都不动 → 看第 3 条。
+2. 用 `Ctrl+Shift+T` 走同一条 `commitSelection`：快捷键正常而按钮异常 → 属于第 2 类事件竞态；两者都不动 → 看第 4 条。
 3. 在页面上直接跑一次真请求（不经插件 UI），确认宿主与模型链路：
    ```powershell
    curl.exe -N -X POST http://127.0.0.1:3080/dsh-translator/translate `
@@ -180,7 +237,7 @@ async function attempt(request) { await fetch(…) }
    有 `start` → 多个 `delta` → `done` 且是中文 ⇒ 宿主正常，问题在浏览器半边（看第 1、2 条）；否则看 `GET /dsh-translator/health` 的 `llm`/`route` 字段。
 4. 右侧边栏不可用时，插件会退化成浮层卡片并在卡片上写明原因，**不会出现"点了什么都没有"**。
 
-### 4. `?dsht-debug=1`：让页面自己交代状态
+### 5. `?dsht-debug=1`：让页面自己交代状态
 
 **任何"面板空白 / 没有译文"的排查都从这里开始**，因为它一次回答六个问题，而且不需要开 DevTools：
 
@@ -212,15 +269,15 @@ http://127.0.0.1:3080/?token=<你的一次性 token>&dsht-debug=1
 | `bundle` | **页面跑的是哪个 build**。和 `lib/client.js` 的构建时间一比就知道是不是旧产物——浏览器只在页面加载时取一次客户端 bundle，**每次 `node build.mjs` 之后必须刷新页面**，否则你看到的是旧代码，和"新 bug"长得一模一样 |
 | `styles tag` | 样式表注入了没有 |
 | `services` | `slots` / `sidebarRight` / `sidebarRightTabs` / `sessions` 四个服务在不在 |
-| `tab id / kind` + `seat keys` | 定义 `id`、`openTab` 用的 `kind`、两个座位注册的 `key`（必须 `key === id`，见第 0 条） |
+| `tab id / kind` + `seat keys` | 定义 `id`、`openTab` 用的 `kind`、两个座位注册的 `key`（必须 `key === id`，见第 1 条） |
 | `slots.snapshot` / `slot.title` / `tab types` | **官方运行时诊断**：座位里到底有没有我的条目、是否 `inactive`（=渲染抛错被退位）、已注册的 `id/kind` 对 |
 | `refs` | 引用列表的真实状态（`done:12字` 这种），区分"没建引用"和"建了没显示" |
 | `render errors` | 渲染失败记录（由 `useSafeSnapshot` 与 `recordRenderFailure` 写入） |
 | `openTab` / `pane render` | 直接调用一次 `openTab(kind)` 与面板组件，看谁抛错 |
 
-判读口诀：**空白面板 = 座位条目被退位（组件渲染抛错，DOM 里只剩 `div[data-slot-error]`）；那句"这类内容还没有可用的查看方式。" = 座位 key 和定义 `id` 不一致**（见第 0 条）。
+判读口诀：**空白面板 = 座位条目被退位（组件渲染抛错，DOM 里只剩 `div[data-slot-error]`）；那句"这类内容还没有可用的查看方式。" = 座位 key 和定义 `id` 不一致**（见第 1 条）。
 
-### 5. 绝对不要把数据 prop 命名成 `ref`（组件会拿到 `undefined`）
+### 6. 绝对不要把数据 prop 命名成 `ref`（组件会拿到 `undefined`）
 
 `ref` 和 `key` 一样是 **React 保留 prop**：`React.createElement(RefCard, { ref: someData })` 会让 React 把 `someData` 当成"元素引用"收走，**组件里 `props.ref` 永远是 `undefined`**。
 
@@ -285,19 +342,24 @@ curl.exe -N -X POST http://127.0.0.1:3080/dsh-translator/translate `
 
 ```powershell
 npm run build     # 构建 lib/client.js（浏览器半边）与 lib/index.js（宿主半边）
-npm test          # 58 个单测：文本策略 / SSE 分帧 / LRU / 宿主路由端到端 / 浏览器半边挂载
-npm run verify    # build + test + 产物契约校验（含 apply 真挂载、Config 禁令）
+npm test          # 86 个单测：文本策略 / SSE 分帧 / LRU / 宿主路由端到端 / 浏览器半边挂载 / 兼容性探针
+npm run verify    # build + test + 产物契约校验（含 apply 真挂载、Config 禁令、inject 必须为空）
+npm run compat    # 离线核对：本插件绑定的服务/槽位在**当前装的** dsh 里是否都还在（升级 dsh 后先跑这个）
 ```
 
 - **无构建依赖**：`build.mjs` 是一个约 300 行的自写打包器（模块表 + 内部 require），配 `build-jsx.mjs`（JSX → `React.createElement`，支持元素/属性/表达式子节点/属性与子节点里嵌套的 JSX），只用 Node——不需要 esbuild、rolldown 或任何平台二进制（本机沙箱禁止子进程 spawn，esbuild 起不来）。
 - 源码在 `src/`：`shared/`（两侧共用纯逻辑）、`host/`（SSE 路由与 LLM 调用）、`client/`（划选监听、引用 store、侧边栏页签）。
 - 单改客户端：`node build.mjs` 后刷新页面；改宿主：重启 `dsh web`。
 - `tools/try-jsx.mjs`、`tools/try-jsx-inline.mjs` 用来单独检查 JSX 转换结果（`node tools/try-jsx.mjs src/client/TranslatePane.jsx`）。
-- `test/client.test.mjs` 用假 DOM + React 桩**真挂载打包后的客户端 bundle**（就是 DSH 模块系统 `__ModuleLoader__.load` 那条路径），断言页签类型、两个槽位、设置项、快捷键监听都注册成功，并把「侧边栏页签渲染出一条已完成译文」也断言掉——客户端 `apply` 抛错会拖垮整个客户端组合，和宿主半边那次事故同类，所以这里对着真产物测。
+- `test/client.test.mjs` 用假 DOM + React 桩**真挂载打包后的客户端 bundle**（就是 DSH 模块系统 `__ModuleLoader__.load` 那条路径），断言页签类型、两个槽位、设置项、快捷键监听都注册成功，并把「侧边栏页签渲染出一条已完成译文」也断言掉——客户端 `apply` 抛错会拖垮整个客户端组合，和宿主半边那次事故同类，所以这里对着真产物测。**假 context 也实现了 `inject(deps, cb)`**：服务齐了就同步跑回调，缺了就记为 parked，所以"缺服务只降级"这条也有回归测试守着。
+- `tools/check-dsh-compat.mjs` 是**升级 dsh 前的离线绊线**：它从构建产物里读出本插件绑定的每个服务名与槽位名，再去已安装的 `@deepseek-ai/*` 的 js/d.ts 里找同名字符串。命中不代表一定没错，但**一个名字彻底消失 = 下次开机就是那块 `Failed to load plugins`**。`test/compat.test.mjs` 用 `settingsScope`（0.1.7 真删掉的那个）当标本，保证这条绊线不是橡皮图章。
+- `tools/cdp-boot-probe.mjs` 用真 Chrome（CDP）回答最后一个问题：**页面到底起没起来**。判定标准是"输入框在、`#root` 有内容、body 里没有 `Failed to load plugins`"。起 headless Chrome 的完整命令见 `HANDOVER.md` §5。
+- `tools/cdp-full-flow.mjs` / `cdp-dump.mjs` / `cdp-dig.mjs` / `cdp-surface-audit.mjs`：端到端取证、DOM 大盘点、右栏结构深挖、划选命中率量化。
 
 ## 兼容性
 
-- 实测环境：DSH **`0.1.6-alpha.2`**（本机 `dsh --version`），客户端按 `dsh.client.platform = web` 由 DSH 客户端模块图装载。依赖面与各组件版本见上文 §「依赖与版本」。
-- 只用公开扩展点：`slots`、`sidebarRight` / `sidebarRightTabs`（两段式页签注册）、`sessions`、`uiConversation`（`chat` target 的 `legacy` 投影）、`ctx.llm.stream`、`ctx.webServer.register`、`ctx.systemPrompt.section`。
+- 实测环境：DSH **`0.1.7-rc.2`**（本机 `dsh --version`），端到端实测通过；客户端按 `dsh.client.platform = web` 由 DSH 客户端模块图装载。依赖面与各组件版本见上文 §「依赖与版本」。
+- 只用公开扩展点：`slots`（`inject` / `register`）、`sidebarRight` / `sidebarRightTabs`（两段式页签注册）、`settings.general.item` 设置行、`uiSession.adapter.current`（当前会话作用域）、`uiConversation`（`chat` target 的 `legacy` 投影）、`ctx.llm.stream`、`ctx.webServer.register` / `tapIndex`、`ctx.systemPrompt.section`。
+- **没有任何硬依赖**：`inject` 是空数组，所有服务都在各自的 `ctx.inject` 子 fiber 里等。服务缺失只会让那一项能力停摆，绝不会让整个 Web UI 起不来（见 §「已知坑与排查」0）。
 - 右侧边栏不可用时不会报错：译文退化为一个固定浮层卡片，功能仍可用。
 - 配置校验不走加载器的 schema（见上文），因此插件配置键由本插件自己把关；profile 里写错键会在 `apply()` 阶段抛错。

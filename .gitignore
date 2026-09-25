@@ -10,6 +10,11 @@ node_modules/
 # not part of the plugin.
 .evidence/
 
+# Headless-Chrome profiles used by tools/cdp-*.mjs. They are recreated in seconds by
+# the documented flow, and they hold the login cookie of a real dsh web instance —
+# never commit one.
+.chrome-prof*/
+
 # Handover notes kept local on purpose: they describe this machine's profile
 # layout and the debugging history, which is not plugin material.
 HANDOVER.md

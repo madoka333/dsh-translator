@@ -48,9 +48,23 @@ for (const name of ['apply', 'inject']) {
   assert.ok(name in clientExports, `client bundle must export ${name}`)
 }
 assert.ok(Array.isArray(clientExports.inject))
-for (const service of ['slots', 'sidebarRight', 'sidebarRightTabs', 'sessions', 'uiConversation', 'settingsScope']) {
-  assert.ok(clientExports.inject.includes(service), `client must declare the ${service} service`)
-}
+// A hard `inject` list is a loaded gun pointed at web boot: dsh's client boot
+// THROWS when any loader entry is still pending on a service, so one renamed
+// service in one plugin blanks the whole Web GUI. Every capability is waited for
+// in its own child fiber instead (see src/client/index.jsx's `inject` doc).
+assert.deepEqual(clientExports.inject, [], 'the browser half must declare no hard service dependency')
+assert.deepEqual(clientExports.SIDEBAR_SERVICES, ['slots', 'sidebarRight', 'sidebarRightTabs'])
+assert.deepEqual(clientExports.SETTINGS_SERVICES, ['slots'])
+assert.equal(clientExports.SESSION_SCOPE_SERVICE, 'uiSession')
+// `guide[].id` is REQUIRED as of 0.1.7 (ui-sidebar-right rejects colliding entry
+// ids, and two absent ids collide). The bundle is checked here too because the
+// registration runs in the browser, where a throw is invisible to this build.
+assert.match(clientSource, /guide:\s*\[/, 'the tab type must ship a guide entry')
+assert.match(
+  clientSource,
+  /id:\s*TAB_ID/,
+  'the guide entry must carry a stable id (0.1.7 rejects colliding guide ids)',
+)
 
 // --- host bundle ----------------------------------------------------------
 const host = await import(new URL('../lib/index.js', import.meta.url).href)

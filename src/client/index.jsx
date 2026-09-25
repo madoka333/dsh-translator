@@ -52,9 +52,59 @@ export const DebugReportExport = DebugReport
 /** @see TranslatePaneExport — read back by the self-report and by the tests. */
 export const renderFailureLogExport = renderFailureLog
 
-/** Required services: slot registry, right sidebar and its tab registry, the
- * session list (storage namespace), the chat read channel, and settings. */
-export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs', 'sessions', 'uiConversation', 'settingsScope']
+/**
+ * Hard service prerequisites: NONE, and that is a deliberate contract.
+ *
+ * dsh's WEB boot walks every client loader entry and THROWS if any of them is not
+ * `active`:
+ *
+ *     if (o.length > 0) throw new Error(`web boot: ${o.length} entries did not activate …`)
+ *
+ * with `pending (waiting for service: X)` counted as not active. One plugin
+ * declaring one service that a DSH upgrade renamed therefore does not degrade
+ * that plugin — it kills the entire Web GUI at the boot screen. That is exactly
+ * what DSH 0.1.7-rc.2 did to this plugin: it deleted the client-side
+ * `settingsScope` service, this package listed it in `inject`, and the whole app
+ * stopped mounting (see README §「已知坑与排查」0).
+ *
+ * So every service is taken through a `ctx.inject([...], cb)` CHILD fiber below.
+ * A child fiber is not a loader entry, so a service that disappears leaves that
+ * one capability parked and everything else — including the rest of dsh —
+ * working. The price is that `apply` must tolerate every service being absent,
+ * which is why it reads them through `ctx.get(name)` and gates each block.
+ */
+export const inject = []
+
+/** Services the sidebar seats need; absence downgrades the plugin, not the app. */
+export const SIDEBAR_SERVICES = ['slots', 'sidebarRight', 'sidebarRightTabs']
+
+/** Services the Settings → General row needs. */
+export const SETTINGS_SERVICES = ['slots']
+
+/** The tab body seat: one component per tab type, keyed by the definition id. */
+const BODY_SLOT = 'sidebar.right.pane.tab'
+/** The tab chip/header seat, same key. */
+const TITLE_SLOT = 'sidebar.right.pane.tab.title'
+/** One preference row inside Settings → General. */
+const SETTINGS_SLOT = 'settings.general.item'
+
+/**
+ * Every slot this plugin contributes to.
+ *
+ * Exported so `tools/check-dsh-compat.mjs` can verify — against the DSH actually
+ * installed — that each name still exists, instead of letting the next `dsh`
+ * upgrade discover it the hard way.
+ */
+export const SLOT_SEATS = [BODY_SLOT, TITLE_SLOT, SETTINGS_SLOT]
+
+/**
+ * The service that owns the current-Session binding.
+ *
+ * `ui-session` installs itself as the renderer-facing scope adapter for the
+ * `session` scope. Its `adapter.current` binding carries `key: binding.sessionId`
+ * — the Session on screen — and `key: undefined` while nothing is selected.
+ */
+export const SESSION_SCOPE_SERVICE = 'uiSession'
 
 /**
  * Tab type discrimination: what `openTab()` names. The seats are NOT keyed on this
@@ -80,7 +130,7 @@ const TAB_ID = 'dsh-translator'
  * identical from the outside; the `?dsht-debug=1` report prints this line so the
  * two can be told apart in one screenshot.
  */
-const BUNDLE_STAMP = 'client-2026-09-12T04:00Z-hardsafe'
+const BUNDLE_STAMP = 'client-2026-09-25T15:40Z-dsh017'
 
 /** Tab title. */
 const TAB_TITLE = '翻译'
@@ -111,15 +161,58 @@ export function matchesShortcut(event, shortcut) {
   return event.ctrlKey === shortcut.ctrl && event.altKey === shortcut.alt && event.shiftKey === shortcut.shift
 }
 
-/** The active Session id from the sessions list snapshot. */
-function activeSessionId(sessions) {
+/** Read one service without declaring a dependency on it, or undefined. */
+export function serviceOf(ctx, name) {
   try {
-    const snapshot = sessions?.list?.getSnapshot?.()
-    const current = snapshot?.current
-    return typeof current === 'string' && current !== '' ? current : 'default'
+    return ctx?.get?.(name)
   } catch {
-    return 'default'
+    return undefined
   }
+}
+
+/**
+ * The Session the page is currently displaying, or undefined.
+ *
+ * DSH 0.1.7 removed `current` from the Session Controller's list snapshot — that
+ * snapshot is catalog membership only now (`ids` / `byId` / `phase`), because
+ * "which Session is on screen" moved to the view owners. The public source of that
+ * fact is the renderer-facing scope adapter: `uiSession.adapter.current` is a
+ * `StandardSourceBinding` whose `key` IS the Session id.
+ *
+ * @param ctx - client context.
+ * @returns the Session id, or undefined when nothing is selected (or unavailable).
+ */
+export function scopeSessionKey(ctx) {
+  const binding = scopeBinding(ctx)
+  const key = binding?.key
+  return typeof key === 'string' && key !== '' ? key : undefined
+}
+
+/**
+ * The raw current scope binding, or undefined when the service is not there.
+ * @param ctx - client context.
+ * @returns the binding snapshot.
+ */
+export function scopeBinding(ctx) {
+  try {
+    const current = serviceOf(ctx, SESSION_SCOPE_SERVICE)?.adapter?.current
+    return typeof current?.getSnapshot === 'function' ? current.getSnapshot() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The storage namespace for this plugin's reference list.
+ *
+ * Store namespaces are local to the browser (one localStorage key per Session), so
+ * an unresolvable Session degrades to a shared bucket rather than to lost cards.
+ *
+ * @param ctx - client context.
+ * @returns a Session id, or `'default'`.
+ */
+export function sessionKeyOf(ctx) {
+  return scopeSessionKey(ctx) ?? 'default'
 }
 
 /** Whether this page asked for the plugin's self-report (`?dsht-debug=1`). */
@@ -181,7 +274,7 @@ export function apply(ctx) {
   installErrorCapture()
 
   const settings = new SettingsStore()
-  const store = new RefsStore(activeSessionId(ctx.sessions))
+  const store = new RefsStore(sessionKeyOf(ctx))
 
   // Portal roots render from these: `apply` has no hooks, so the two React trees
   // are driven by an explicit re-render call instead.
@@ -192,21 +285,39 @@ export function apply(ctx) {
 
   let fallbackOpen = false
   let fallbackReason = ''
+  /** Where the current namespace came from, for the self-report. */
+  let sessionSource = scopeSessionKey(ctx) === undefined ? 'default' : SESSION_SCOPE_SERVICE
   /** Seat keys recorded at registration time, so the self-report can prove them. */
   const seatKeys = { type: '', body: '(not registered)', title: '(not registered)' }
+
+  /** Switch the store's namespace and remember which source decided it. */
+  const useSession = (key, source) => {
+    if (typeof key !== 'string' || key === '') return
+    sessionSource = source
+    store.setSession(key)
+  }
+
+  /** Record why the floating card is standing in for the sidebar. */
+  const useFallback = (cause) => {
+    fallbackOpen = true
+    fallbackReason = cause instanceof Error ? cause.message : String(cause)
+    rerender()
+  }
 
   /** Open the sidebar pane when that column exists; otherwise reveal the card. */
   const openPane = () => {
     try {
-      ctx.sidebarRight.openTab(KIND)
+      const sidebar = serviceOf(ctx, 'sidebarRight')
+      if (sidebar === undefined || typeof sidebar.openTab !== 'function') {
+        throw new Error('右侧边栏服务不可用（未安装 dsh-client-ui-sidebar-right？）')
+      }
+      sidebar.openTab(KIND)
       return true
     } catch (cause) {
       // Never fail silently: a click that produced nothing visible is exactly the
       // bug worth preventing, so the fallback card says why it appeared.
       console.warn('[dsh-translator] 右侧边栏不可用，改用浮层卡片:', cause)
-      fallbackOpen = true
-      fallbackReason = cause instanceof Error ? cause.message : String(cause)
-      rerender()
+      useFallback(cause)
       return false
     }
   }
@@ -247,7 +358,9 @@ export function apply(ctx) {
     addRef: (text, meta = {}) => {
       const classified = classifySelection(text)
       if (classified.action === 'ignore') return null
-      const snapshot = readChatSnapshot(ctx.get('uiConversation'), activeSessionId(ctx.sessions))
+      // Provenance is decoration: `uiConversation` is read, not declared, so a
+      // renamed service costs the card its turn/step label and nothing else.
+      const snapshot = readChatSnapshot(serviceOf(ctx, 'uiConversation'), store.sessionKey())
       const label = meta.sourceLabel ?? provenanceFor(snapshot, classified.text)
       return store.add(
         {
@@ -297,6 +410,8 @@ export function apply(ctx) {
   }
 
   // --- Selection watcher + trigger root ------------------------------------
+  // Neither needs a service: these run even when the sidebar half is absent, which
+  // is what keeps the plugin useful in a composition without a right column.
   ctx.effect(() => {
     const teardown = watchSelection((next) => {
       lastSelection = next
@@ -353,82 +468,152 @@ export function apply(ctx) {
     return () => window.removeEventListener('keydown', onKeyDown, true)
   }, 'dsh-translator: translate shortcut')
 
-  // --- Sidebar tab type (two-stage registration) ---------------------------
-  ctx.effect(() => {
-    // The seats are dispatched with `definition.id ?? tab.kind` (see
-    // `TabSlot` in ui-sidebar-right), so the BODY and TITLE registrations must key
-    // on the definition id — not on the kind. Keying on the kind leaves both seats
-    // unresolved and the pane renders the column's own fallback notice
-    // ("这类内容还没有可用的查看方式。"), which is exactly how this broke once.
-    const disposeType = ctx.sidebarRightTabs.register({
-      id: TAB_ID,
-      kind: KIND,
-      title: () => TAB_TITLE,
-      guide: [
-        {
-          order: 40,
+  // --- Session namespace (soft: `uiSession`) -------------------------------
+  // One localStorage list per Session, so switching Sessions shows that Session's
+  // own references instead of a shared pile. If this service ever goes away the
+  // store simply stays on `default` — and the pane's own `sessionId` prop (below)
+  // re-scopes it as soon as the pane is on screen.
+  ctx.inject([SESSION_SCOPE_SERVICE], (scopeCtx) => {
+    scopeCtx.effect(() => {
+      const source = scopeCtx?.uiSession?.adapter?.current
+      if (source === undefined || typeof source.getSnapshot !== 'function') {
+        return () => {}
+      }
+      const sync = () => useSession(source.getSnapshot()?.key, SESSION_SCOPE_SERVICE)
+      sync()
+      const unsubscribe = source.subscribe?.(sync)
+      return () => unsubscribe?.()
+    }, 'dsh-translator: session scope')
+  }, 'dsh-translator: session namespace')
+
+  // --- Sidebar tab type + seats (soft) -------------------------------------
+  // This is the block that used to be a top-level `inject`, i.e. the block whose
+  // missing service used to take the whole Web GUI down with it.
+  ctx.inject(SIDEBAR_SERVICES, (sidebarCtx) => {
+    sidebarCtx.effect(() => {
+      // The seats are dispatched with `definition.id ?? tab.kind` (see
+      // `TabSlot` in ui-sidebar-right), so the BODY and TITLE registrations must key
+      // on the definition id — not on the kind. Keying on the kind leaves both seats
+      // unresolved and the pane renders the column's own fallback notice
+      // ("这类内容还没有可用的查看方式。"), which is exactly how this broke once.
+      let disposeType
+      let disposeBody
+      let disposeTitle
+      try {
+        disposeType = sidebarCtx.sidebarRightTabs.register({
+          id: TAB_ID,
+          kind: KIND,
           title: () => TAB_TITLE,
-          description: () => '划选对话里的英文，在这里看实时中文译文',
-        },
-      ],
-    })
-    // Both seats stay PLAIN components — no wrapper. A wrapper that calls its
-    // children as plain functions during render would run TranslatePane's hooks
-    // under the wrapper's identity, which is exactly the rules-of-hooks violation
-    // that can blank the whole subtree in a real React. Failure visibility is
-    // handled inside the pane instead (see TranslatePane's own guard).
-    const PaneHost = () => React.createElement(TranslatePane, { store, runtime })
-    const TitleHost = () => React.createElement(TranslateTitle, { store, title: TAB_TITLE })
-    seatKeys.type = TAB_ID
-    seatKeys.body = TAB_ID
-    seatKeys.title = TAB_ID
-    const disposeBody = ctx.slots.inject('sidebar.right.pane.tab', () =>
-      ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TAB_ID }, PaneHost),
-    )
-    const disposeTitle = ctx.slots.inject('sidebar.right.pane.tab.title', () =>
-      ctx.slots.register({ name: 'sidebar.right.pane.tab.title', key: TAB_ID }, TitleHost),
-    )
-    return () => {
-      disposeTitle()
-      disposeBody()
-      disposeType()
-    }
-  }, 'dsh-translator: sidebar tab type')
+          // `guide[].id` became REQUIRED in 0.1.7: ui-sidebar-right rejects a
+          // provider whose entries collide on `id`, and an absent id collides with
+          // every other absent one.
+          guide: [
+            {
+              id: TAB_ID,
+              order: 40,
+              title: () => TAB_TITLE,
+              description: () => '划选对话里的英文，在这里看实时中文译文',
+            },
+          ],
+        })
+        // Both seats stay PLAIN components — no wrapper. A wrapper that calls its
+        // children as plain functions during render would run TranslatePane's hooks
+        // under the wrapper's identity, which is exactly the rules-of-hooks violation
+        // that can blank the whole subtree in a real React. Failure visibility is
+        // handled inside the pane instead (see TranslatePane's own guard).
+        //
+        // `sidebar.right.pane.tab` is a `session`-scoped keyed slot, so the renderer
+        // hands the body a flat `sessionId` prop: that is the authoritative Session
+        // for the pane the user is looking at, and it re-scopes the store even when
+        // the scope service above is unavailable.
+        const PaneHost = (props) => {
+          const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : undefined
+          return sessionId === undefined
+            ? React.createElement(TranslatePane, { store, runtime })
+            : React.createElement(TranslatePane, { store, runtime, sessionKey: sessionId })
+        }
+        const TitleHost = () => React.createElement(TranslateTitle, { store, title: TAB_TITLE })
+        seatKeys.type = TAB_ID
+        seatKeys.body = TAB_ID
+        seatKeys.title = TAB_ID
+        disposeBody = sidebarCtx.slots.inject(BODY_SLOT, () =>
+          sidebarCtx.slots.register({ name: BODY_SLOT, key: TAB_ID }, PaneHost),
+        )
+        disposeTitle = sidebarCtx.slots.inject(TITLE_SLOT, () =>
+          sidebarCtx.slots.register({ name: TITLE_SLOT, key: TAB_ID }, TitleHost),
+        )
+      } catch (cause) {
+        // A sidebar we cannot seat is a degraded plugin, never a broken one: this
+        // used to throw out of `apply`, which at boot means no Web GUI at all.
+        console.warn('[dsh-translator] 右侧边栏页签注册失败，改用浮层卡片:', cause)
+        try {
+          disposeTitle?.()
+        } catch {
+          /* nothing to undo */
+        }
+        try {
+          disposeBody?.()
+        } catch {
+          /* nothing to undo */
+        }
+        try {
+          disposeType?.()
+        } catch {
+          /* nothing to undo */
+        }
+        seatKeys.type = `失败: ${cause instanceof Error ? cause.message : String(cause)}`
+        seatKeys.body = '(not registered)'
+        seatKeys.title = '(not registered)'
+        useFallback(cause)
+        return () => {}
+      }
+      return () => {
+        disposeTitle()
+        disposeBody()
+        disposeType()
+      }
+    }, 'dsh-translator: sidebar tab type')
+  }, 'dsh-translator: sidebar tab type + seats')
 
-  // --- Settings → General row ----------------------------------------------
-  ctx.effect(() => {
-    const SettingsHost = () => React.createElement(SettingsRow, { store: settings })
-    return ctx.slots.inject('settings.general.item', () =>
-      ctx.slots.register({ name: 'settings.general.item', id: 'translator', order: 60 }, SettingsHost),
-    )
-  }, 'dsh-translator: settings row')
-
-  // --- Session switching (storage namespace) -------------------------------
-  ctx.effect(() => {
-    const sync = () => store.setSession(activeSessionId(ctx.sessions))
-    const unsubscribe = ctx.sessions?.list?.subscribe?.(sync)
-    return () => unsubscribe?.()
-  }, 'dsh-translator: session scope')
+  // --- Settings → General row (soft) ---------------------------------------
+  ctx.inject(SETTINGS_SERVICES, (slotCtx) => {
+    slotCtx.effect(() => {
+      const SettingsHost = () => React.createElement(SettingsRow, { store: settings })
+      try {
+        return slotCtx.slots.inject(SETTINGS_SLOT, () =>
+          slotCtx.slots.register({ name: SETTINGS_SLOT, id: 'translator', order: 60 }, SettingsHost),
+        )
+      } catch (cause) {
+        console.warn('[dsh-translator] 设置项注册失败:', cause)
+        return () => {}
+      }
+    }, 'dsh-translator: settings row')
+  }, 'dsh-translator: settings row seat')
 
   // --- Self-report (`?dsht-debug=1`) ---------------------------------------
   ctx.effect(() => {
     if (!debugRequested()) return () => {}
     const errors = renderFailureLog()
+    const slots = serviceOf(ctx, 'slots')
+    const sidebarRight = serviceOf(ctx, 'sidebarRight')
+    const tabs = serviceOf(ctx, 'sidebarRightTabs')
     const lines = [
       `plugin        : dsh-translator (client)`,
       `bundle        : ${BUNDLE_STAMP}（与 lib/client.js 的构建时间对照；不一致=页面跑的是旧产物，需要刷新）`,
       `styles tag    : ${typeof document !== 'undefined' && document.getElementById('dsh-translator-style') !== null}`,
-      `services      : slots=${typeof ctx.slots?.register === 'function'} sidebarRight=${typeof ctx.sidebarRight?.openTab === 'function'} tabs=${typeof ctx.sidebarRightTabs?.register === 'function'} sessions=${typeof ctx.sessions?.list?.getSnapshot === 'function'}`,
+      `services      : slots=${typeof slots?.register === 'function'} sidebarRight=${typeof sidebarRight?.openTab === 'function'} tabs=${typeof tabs?.register === 'function'} uiSession=${serviceOf(ctx, SESSION_SCOPE_SERVICE) !== undefined}`,
+      `hard deps     : ${inject.length === 0 ? '无（全部走 ctx.inject 子 fiber，缺服务只降级不阻塞启动）' : inject.join(', ')}`,
       `tab id / kind : ${TAB_ID} / ${KIND}`,
       `seat keys     : body=${seatKeys.body} title=${seatKeys.title}`,
-      `session       : ${activeSessionId(ctx.sessions)}`,
+      `session       : ${store.sessionKey()}（来源: ${sessionSource}）`,
       `refs          : ${store.list().length}（${store.list().map((ref) => `${ref.status}:${[...(ref.translation ?? '')].length}字`).join(', ') || '空'}）`,
-      `slots.snapshot: ${describeSlot(ctx, 'sidebar.right.pane.tab')}`,
-      `slot.title    : ${describeSlot(ctx, 'sidebar.right.pane.tab.title')}`,
-      `tab types     : ${describeTabTypes(ctx)}`,
+      `slots.snapshot: ${describeSlot(slots, 'sidebar.right.pane.tab')}`,
+      `slot.title    : ${describeSlot(slots, 'sidebar.right.pane.tab.title')}`,
+      `tab types     : ${describeTabTypes(tabs)}`,
       `openTab       : ${(() => {
         try {
-          ctx.sidebarRight.openTab(KIND)
+          if (typeof sidebarRight?.openTab !== 'function') return 'SKIPPED（sidebarRight 不可用）'
+          sidebarRight.openTab(KIND)
           return 'ok'
         } catch (error) {
           return `THREW ${error instanceof Error ? error.message : String(error)}`
@@ -452,17 +637,30 @@ export function apply(ctx) {
 
 /**
  * Describe one slot's occupants through the runtime's own diagnostic API.
- * @param ctx - client context.
+ *
+ * The shape changed in 0.1.7: `slots.snapshot(root?)` used to answer with ONE
+ * node carrying `declaredBy` / `occupants`; it is now an ARRAY of live
+ * composition nodes (`LiveCompositionNode[]`), and the node whose `name` matches
+ * is the one to read. Reporting the old shape produced a permanent
+ * `declaredBy=? occupants=[无]` line — a debug surface that lies is worse than
+ * none.
+ *
+ * @param slots - the slot registry, or undefined when the service is absent.
  * @param slot - slot name.
  * @returns a one-line summary.
  */
-function describeSlot(ctx, slot) {
+export function describeSlot(slots, slot) {
   try {
-    const snapshot = ctx.slots?.snapshot?.(slot)
-    if (snapshot === undefined || snapshot === null) return '（无快照 API）'
-    const occupants = Array.isArray(snapshot.occupants) ? snapshot.occupants : []
-    const described = occupants.map((entry) => `${entry.key ?? entry.id ?? '?'}${entry.active === false ? '(inactive)' : ''}`)
-    return `declaredBy=${snapshot.declaredBy ?? '?'} occupants=[${described.join(', ') || '无'}]`
+    if (slots === undefined || typeof slots.snapshot !== 'function') return '（无快照 API）'
+    const tree = slots.snapshot(slot)
+    const nodes = Array.isArray(tree) ? tree : [tree]
+    const node = nodes.find((candidate) => candidate?.name === slot) ?? nodes.find((candidate) => candidate?.type === 'slot')
+    if (node === undefined) return '（该槽位未声明）'
+    const occupants = Array.isArray(node.occupants) ? node.occupants : []
+    const described = occupants.map(
+      (entry) => `${entry.key ?? entry.id ?? '?'}${entry.active === false ? '(inactive)' : ''}`,
+    )
+    return `declaredBy=${node.declaredBy ?? '?'} occupants=[${described.join(', ') || '无'}]`
   } catch (error) {
     return `THREW ${error instanceof Error ? error.message : String(error)}`
   }
@@ -471,12 +669,12 @@ function describeSlot(ctx, slot) {
 /**
  * Describe the registered tab types (id/kind pairs), which is what the seat key is
  * derived from.
- * @param ctx - client context.
+ * @param tabs - the tab-type registry, or undefined when the service is absent.
  * @returns a one-line summary.
  */
-function describeTabTypes(ctx) {
+export function describeTabTypes(tabs) {
   try {
-    const entries = ctx.sidebarRightTabs?.entries?.()
+    const entries = tabs?.entries?.()
     if (!Array.isArray(entries)) return '（无 entries API）'
     return entries.map((entry) => `${entry.id}/${entry.kind}`).join(', ') || '（空）'
   } catch (error) {
