@@ -16,6 +16,9 @@ const SETTINGS_KEY = 'dsh-translator:settings'
 /** localStorage key prefix holding one session's reference list. */
 const REFS_PREFIX = 'dsh-translator:refs:'
 
+/** localStorage key prefix holding one session's unsent composer draft. */
+const DRAFT_PREFIX = 'dsh-translator:draft:'
+
 /** How many references one session keeps before the oldest is dropped. */
 const MAX_REFS = 100
 
@@ -119,6 +122,36 @@ export class SettingsStore extends Observable {
     writeJson(SETTINGS_KEY, next)
     this.commit(next)
   }
+}
+
+/**
+ * Read one session's unsent composer draft.
+ *
+ * The composer at the bottom of the pane stages text the user has typed or pasted
+ * but not yet committed. Losing it to a page refresh (or to switching Sessions and
+ * back) is the kind of small betrayal that makes a tool feel unreliable, so the
+ * draft is kept per Session next to that Session's references.
+ *
+ * @param sessionKey - storage namespace (the active Session id).
+ * @returns the draft, or '' when there is none.
+ */
+export function readDraft(sessionKey) {
+  const key = typeof sessionKey === 'string' && sessionKey !== '' ? sessionKey : 'default'
+  const raw = readJson(`${DRAFT_PREFIX}${key}`, null)
+  return typeof raw?.text === 'string' ? raw.text : ''
+}
+
+/**
+ * Store one session's composer draft. An empty draft removes the key instead of
+ * writing an empty blob, so "staged nothing" leaves nothing behind.
+ * @param sessionKey - storage namespace.
+ * @param text - the draft.
+ */
+export function writeDraft(sessionKey, text) {
+  const key = typeof sessionKey === 'string' && sessionKey !== '' ? sessionKey : 'default'
+  const value = String(text ?? '')
+  if (value.trim() === '') removeKey(`${DRAFT_PREFIX}${key}`)
+  else writeJson(`${DRAFT_PREFIX}${key}`, { text: value })
 }
 
 /**

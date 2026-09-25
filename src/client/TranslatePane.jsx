@@ -9,10 +9,11 @@
  * @module dsh-translator/client/TranslatePane
  */
 
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 
 import { LANGUAGE_CHOICES } from '../shared/select.js'
 import { CLS } from './styles.js'
+import { readDraft, writeDraft } from './stores.js'
 
 /** Stable empty store used only by the title's no-store fallback. */
 const EMPTY_STORE = {
@@ -223,8 +224,115 @@ function RefCard({ item, onRetry, onRemove, onCancel, onCopy }) {
 }
 
 /**
+ * The bottom composer: stage text, commit it as one more reference.
+ *
+ * It is deliberately NOT a chat channel — the plugin's contract is that nothing it
+ * shows or collects ever reaches the session log or the model's context, and a real
+ * chat box would break exactly that. What this does is the same thing the floating
+ * 「译」 button does, for text you would rather type or paste than select: Enter
+ * turns the box's content into a reference, and the existing translate pipeline
+ * takes it from there. Shift+Enter inserts a newline.
+ *
+ * The draft is kept per Session (the `dsh-translator:draft:` key prefix plus the
+ * Session id) and persisted on every keystroke, so a refresh never eats what you
+ * were in the middle of typing. The component is mounted with `key={sessionKey}`:
+ * switching Sessions remounts it, which is what makes "load the incoming Session's
+ * draft" a plain `useState` initializer instead of a race between two effects.
+ *
+ * @param props - `{runtime, sessionKey, onNotice}`.
+ */
+function Composer({ runtime, sessionKey, onNotice }) {
+  const [text, setText] = useState(() => readDraft(sessionKey))
+  const [composing, setComposing] = useState(false)
+
+  /** Every edit goes to the draft store immediately — there is no flush button. */
+  const update = useCallback(
+    (next) => {
+      setText(next)
+      writeDraft(sessionKey, next)
+    },
+    [sessionKey],
+  )
+
+  const commit = useCallback(() => {
+    if (text.trim() === '') return
+    if (typeof runtime?.addManual !== 'function') {
+      onNotice?.('这个宿主不支持手动输入')
+      return
+    }
+    const result = runtime.addManual(text)
+    if (result?.ok === true) {
+      update('')
+      onNotice?.(`已加入翻译（${[...(result.text ?? text)].length} 字）`)
+      return
+    }
+    if (result?.reason === 'already-chinese') {
+      onNotice?.('这段已经是中文了，没有送翻译')
+      return
+    }
+    onNotice?.('没有可翻译的内容')
+  }, [onNotice, runtime, text, update])
+
+  const onKeyDown = useCallback(
+    (event) => {
+      if (event.key !== 'Enter') return
+      // An Enter that ends an IME candidate window belongs to the input method, not
+      // to us: without this guard, typing Chinese and picking a candidate would
+      // submit half a word.
+      if (composing || event.nativeEvent?.isComposing === true) return
+      if (event.shiftKey) return
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      event.preventDefault()
+      commit()
+    },
+    [commit, composing],
+  )
+
+  /**
+   * Stage a drop instead of letting it through.
+   *
+   * The box is a controlled `value`, so the browser's own insert-into-textarea is
+   * overwritten on the next render — a drop would look like it did nothing. And
+   * letting the event bubble would ALSO reach the pane's own drop handler, which
+   * adds the text as a reference: one drop, translated twice.
+   */
+  const onDrop = useCallback(
+    (event) => {
+      const dropped = event.dataTransfer?.getData('text/plain') ?? ''
+      if (dropped.trim() === '') return
+      event.preventDefault()
+      event.stopPropagation()
+      update(text.trim() === '' ? dropped : `${text}\n${dropped}`)
+    },
+    [text, update],
+  )
+
+  return (
+    <div className={`${CLS}-composer`} data-dsh-translator-ui="1">
+      <textarea
+        className={`${CLS}-input`}
+        value={text}
+        rows={2}
+        spellCheck={false}
+        aria-label="输入要翻译的内容"
+        placeholder="输入或粘贴内容，回车即翻译（Shift+Enter 换行）"
+        onChange={(event) => update(event.target.value)}
+        onKeyDown={onKeyDown}
+        onDrop={onDrop}
+        onDragOver={(event) => event.preventDefault()}
+        onCompositionStart={() => setComposing(true)}
+        onCompositionEnd={() => setComposing(false)}
+      />
+      <button type="button" disabled={text.trim() === ''} title="翻译输入框里的内容" onClick={commit}>
+        翻译
+      </button>
+    </div>
+  )
+}
+
+/**
  * @param props - `{store, runtime, sessionKey}` where `runtime` is
- * `{addRef, retry, cancel, remove, clear, setLanguage, language}` and
+ * `{addRef, addManual, retry, cancel, remove, clear, setLanguage, language}` and
  * `sessionKey` is the Session the pane is seated in.
  *
  * `sessionKey` arrives as the slot's own `sessionId` prop: `sidebar.right.pane.tab`
@@ -290,7 +398,22 @@ export function TranslatePane({ store, runtime, sessionKey }) {
   // the whole seat and leave the column showing an empty pane with only a
   // `data-slot-error` marker in the DOM — invisible to the user.
   try {
-    return renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, handleCopy })
+    // The composer is mounted with `key={sessionKey}` on purpose: switching Sessions
+    // remounts it, so loading the incoming Session's draft is a `useState`
+    // initializer rather than a race between a persist effect and a load effect.
+    //
+    // `sessionKey` is never handed over as `undefined`: a slot host is entitled to
+    // treat an undefined prop as a wiring mistake, and the draft store already maps
+    // '' to the shared bucket.
+    const composer = (
+      <Composer
+        key={sessionKey ?? 'default'}
+        runtime={runtime}
+        sessionKey={typeof sessionKey === 'string' ? sessionKey : ''}
+        onNotice={flash}
+      />
+    )
+    return renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, handleCopy, composer })
   } catch (error) {
     console.error('[dsh-translator] 面板渲染失败:', error)
     return failurePanel(recordRenderFailure(error))
@@ -311,7 +434,7 @@ function failurePanel(message) {
 }
 
 /** The pane's markup, kept separate so the caller can guard it in one place. */
-function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, handleCopy }) {
+function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, handleCopy, composer }) {
   return (
     <div
       className={`${CLS}-pane`}
@@ -337,6 +460,9 @@ function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, hand
           ))}
         </select>
         <span className={`${CLS}-spacer`} />
+        <span className={`${CLS}-beta`} title="dsh-translator beta 分支：底部输入框">
+          beta
+        </span>
         <span className={`${CLS}-count`}>{notice !== '' ? notice : `${refs.length} 条引用`}</span>
         <button type="button" onClick={() => runtime.clear()} disabled={refs.length === 0}>
           清空
@@ -370,6 +496,7 @@ function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, hand
       )}
 
       <div className={`${CLS}-drop`}>{dragover ? '松手即翻译这段内容' : '把划选内容拖到这里也可以翻译'}</div>
+      {composer}
     </div>
   )
 }

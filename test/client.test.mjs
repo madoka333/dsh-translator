@@ -21,6 +21,7 @@ import { readFile } from 'node:fs/promises'
 import test, { afterEach } from 'node:test'
 
 import { handleMouseDown, isOwnUiNode, watchSelection } from '../src/client/watch.js'
+import { CLS } from '../src/client/styles.js'
 
 /**
  * Effects the React stub collected during the last component render.
@@ -690,6 +691,215 @@ test('the pane re-scopes the store to the Session it is seated in', async () => 
   const bare = { getSnapshot: () => ({ refs: [], active: null }), subscribe: () => () => {} }
   assertRenderable(exports.TranslatePaneExport({ store: bare, runtime, sessionKey: 'session-3' }))
   for (const effect of capturedEffects) effect()
+})
+
+// ---------------------------------------------------------------------------
+// beta: the bottom composer.
+//
+// The feature is deliberately NOT a chat channel — the plugin's contract is that
+// nothing it collects reaches the session log or the model's context. What the box
+// does is what the floating 「译」 button does, for text the user would rather type
+// or paste than select: Enter turns the staged text into one more reference.
+// ---------------------------------------------------------------------------
+
+/** Find the first element in a tree (or its rendered components) matching `predicate`. */
+function findElement(node, predicate, depth = 0) {
+  if (depth > 40 || node === null || node === undefined) return undefined
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findElement(child, predicate, depth + 1)
+      if (hit !== undefined) return hit
+    }
+    return undefined
+  }
+  if (typeof node !== 'object') return undefined
+  if (predicate(node) === true) return node
+  if (typeof node.type === 'function') return findElement(node.type(node.props ?? {}), predicate, depth + 1)
+  for (const child of node.children ?? []) {
+    const hit = findElement(child, predicate, depth + 1)
+    if (hit !== undefined) return hit
+  }
+  return undefined
+}
+
+/** The composer's textarea, reached through the pane's own component tree. */
+function composerInput(tree) {
+  return findElement(tree, (node) => node?.props?.['aria-label'] === '输入要翻译的内容')
+}
+
+/** A keydown event shaped like the ones React hands a handler. */
+function keyEvent(key, extra = {}) {
+  return {
+    key,
+    shiftKey: false,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    prevented: false,
+    preventDefault() {
+      this.prevented = true
+    },
+    ...extra,
+  }
+}
+
+/** Stage a draft the way a previous keystroke would have. */
+function seedDraft(sessionKey, text) {
+  globalThis.localStorage.setItem(`dsh-translator:draft:${sessionKey}`, JSON.stringify({ text }))
+}
+
+/** Read back the staged draft, or null when nothing is staged. */
+function readStagedDraft(sessionKey) {
+  return globalThis.localStorage.getItem(`dsh-translator:draft:${sessionKey}`)
+}
+
+/** A runtime spy whose `addManual` answers with `result`. */
+function composerRuntime(result = { ok: true, key: 'k1', text: 'x' }) {
+  const calls = { manual: [], refs: [] }
+  return {
+    calls,
+    runtime: {
+      addRef: (text) => calls.refs.push(text),
+      addManual: (text) => {
+        calls.manual.push(text)
+        return { ...result, text: result.text ?? text }
+      },
+      retry: () => {},
+      cancel: () => {},
+      remove: () => {},
+      clear: () => {},
+      setLanguage: () => {},
+      language: 'zh-CN',
+      shortcut: 'Ctrl+Shift+T',
+    },
+  }
+}
+
+const EMPTY_SNAPSHOT_STORE = { getSnapshot: () => ({ refs: [], active: null }), subscribe: () => () => {} }
+
+test('classifyManualInput drops the selection length floor but keeps the two real refusals', async () => {
+  const { exports } = await mount()
+  const { classifyManualInput } = exports
+  assert.equal(classifyManualInput('   ').action, 'blank')
+  assert.equal(classifyManualInput('').action, 'blank')
+  assert.equal(classifyManualInput('这段话已经是中文了').action, 'already-chinese')
+  // A typo-length English input is an instruction, not a stray selection: the
+  // 8-character floor that guards the trigger must NOT apply here.
+  assert.deepEqual(classifyManualInput('  OK  '), { action: 'translate', text: 'OK' })
+  const long = classifyManualInput('Let me check\r\n\r\n\r\nthe layout.')
+  assert.equal(long.action, 'translate')
+  assert.equal(long.text, 'Let me check\n\nthe layout.', 'the text is normalized like a selection')
+})
+
+test('the composer sits at the very bottom of the pane, under the drop strip', async () => {
+  const { exports } = await mount()
+  const tree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime: composerRuntime().runtime })
+  assert.equal(tree.props.className, `${CLS}-pane`)
+
+  const children = tree.children
+  const last = children[children.length - 1]
+  const rendered = typeof last.type === 'function' ? last.type(last.props) : last
+  assert.equal(rendered.props.className, `${CLS}-composer`, 'the composer must be the pane\'s LAST child')
+
+  // ...and specifically below the drag-and-drop strip, which used to be the bottom.
+  const dropIndex = children.findIndex(
+    (child) => typeof child?.props?.className === 'string' && child.props.className.endsWith('-drop'),
+  )
+  assert.ok(dropIndex >= 0, 'the drop strip is still rendered')
+  assert.ok(dropIndex < children.length - 1, 'the composer comes after the drop strip')
+
+  assert.equal(typeof composerInput(tree), 'object', 'the composer renders a textarea')
+  assert.ok(renderText(tree).includes('beta'), 'the beta build is labelled in the pane')
+})
+
+test('Enter commits the staged text as one more reference and clears the draft', async () => {
+  const { exports } = await mount()
+  seedDraft('session-A', 'Let me check the repository layout first.')
+  const { runtime, calls } = composerRuntime()
+
+  const tree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime, sessionKey: 'session-A' })
+  const input = composerInput(tree)
+  assert.equal(input.props.value, 'Let me check the repository layout first.', 'the staged draft is restored')
+
+  const event = keyEvent('Enter')
+  input.props.onKeyDown(event)
+
+  assert.deepEqual(calls.manual, ['Let me check the repository layout first.'], 'exactly one commit, with the typed text')
+  assert.equal(calls.refs.length, 0, 'the composer uses addManual, not the selection path')
+  assert.equal(event.prevented, true, 'Enter must not also insert a newline')
+  assert.equal(readStagedDraft('session-A'), null, 'a committed draft is cleared, not left behind')
+})
+
+test('Shift+Enter, IME Enter, a modifier, and an empty box all refuse to commit', async () => {
+  const { exports } = await mount()
+  seedDraft('session-A', 'Let me check the repository layout first.')
+  const { runtime, calls } = composerRuntime()
+  const tree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime, sessionKey: 'session-A' })
+  const input = composerInput(tree)
+
+  for (const event of [
+    keyEvent('Enter', { shiftKey: true }),
+    keyEvent('Enter', { nativeEvent: { isComposing: true } }),
+    keyEvent('Enter', { ctrlKey: true }),
+    keyEvent('a'),
+  ]) {
+    input.props.onKeyDown(event)
+  }
+  assert.deepEqual(calls.manual, [], 'none of those may submit')
+  assert.notEqual(readStagedDraft('session-A'), null, 'and the draft stays staged')
+
+  // An empty box is a no-op rather than an error.
+  const empty = composerRuntime()
+  const emptyTree = exports.TranslatePaneExport({
+    store: EMPTY_SNAPSHOT_STORE,
+    runtime: empty.runtime,
+    sessionKey: 'session-none',
+  })
+  composerInput(emptyTree).props.onKeyDown(keyEvent('Enter'))
+  assert.deepEqual(empty.calls.manual, [], 'an empty box submits nothing')
+})
+
+test('a refused commit keeps the draft so the user does not lose their text', async () => {
+  const { exports } = await mount()
+  seedDraft('session-A', 'Let me check the repository layout first.')
+  const { runtime, calls } = composerRuntime({ ok: false, reason: 'already-chinese' })
+  const tree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime, sessionKey: 'session-A' })
+  composerInput(tree).props.onKeyDown(keyEvent('Enter'))
+
+  assert.equal(calls.manual.length, 1, 'the runtime did get the text')
+  assert.notEqual(readStagedDraft('session-A'), null, 'but the box is NOT cleared on a refusal')
+})
+
+test('a draft is per Session, and dropping text stages it instead of translating it twice', async () => {
+  const { exports } = await mount()
+  seedDraft('session-A', 'text staged for A')
+  seedDraft('session-B', 'text staged for B')
+
+  for (const [sessionKey, expected] of [['session-A', 'text staged for A'], ['session-B', 'text staged for B']]) {
+    const tree = exports.TranslatePaneExport({
+      store: EMPTY_SNAPSHOT_STORE,
+      runtime: composerRuntime().runtime,
+      sessionKey,
+    })
+    assert.equal(composerInput(tree).props.value, expected, `${sessionKey} keeps its own draft`)
+  }
+
+  // Dropping onto the box must NOT reach the pane's drop handler: that handler adds
+  // the text as a reference, so one drop would be translated twice.
+  const { runtime, calls } = composerRuntime()
+  const tree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime, sessionKey: 'session-C' })
+  const input = composerInput(tree)
+  let stopped = false
+  input.props.onDrop({
+    dataTransfer: { getData: () => 'Dropped English sentence.' },
+    preventDefault: () => {},
+    stopPropagation: () => {
+      stopped = true
+    },
+  })
+  assert.equal(stopped, true, 'the drop must not bubble to the pane handler')
+  assert.deepEqual(calls.refs, [], 'and must not be added as a reference behind the user\'s back')
+  assert.deepEqual(calls.manual, [], 'nor committed')
 })
 
 test('the mounted tree is renderable and carries no undefined props', async () => {

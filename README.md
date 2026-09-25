@@ -101,7 +101,7 @@ Done in 19.2s using pnpm v11.22.0
 - **升级 DSH 后的三步**（顺序别换）：
   ```powershell
   npm run compat     # 1) 离线静态核对：本插件绑定的服务/槽位在新 DSH 里还在不在
-  npm run verify     # 2) 重建 + 86 个测试 + 产物契约
+  npm run verify     # 2) 重建 + 92 个测试 + 产物契约
   node tools\cdp-boot-probe.mjs   # 3) 真浏览器：页面还起不起得来（需 9222 上的 headless Chrome）
   ```
 
@@ -117,10 +117,35 @@ Done in 19.2s using pnpm v11.22.0
 |---|---|
 | 拖拽「译」按钮到面板 | 与点击等价，拖到面板任意位置松手即翻译 |
 | 把任意文字拖进「翻译」页签 | 页签整体是拖放区，拖进去的内容直接翻译 |
+| **页签最底部的输入框**（beta） | 打字或粘贴 → `Enter` 当新引用送去翻译；`Shift+Enter` 换行。见下节 |
 | `Ctrl+Shift+T` | 翻译当前选区；没有选区时只打开页签（快捷键可在设置里改） |
 | 设置 → 通用 → 划选翻译 | 目标语言、代码块跳过、Think/正文开关、快捷键 |
 
 页签里的每张卡片都可以：复制译文 / 复制原文 / 重新翻译 / 取消 / 删除。顶部工具条可切换目标语言与清空列表。
+
+## beta：页签最底部的输入框
+
+> 这是 **`beta/chat-box` 分支**上的实验功能，版本号 `0.2.0-beta.1`。`main` 保持稳定，回退一条命令：
+> ```powershell
+> git -C D:\data\dsh\dsh-translator switch main && node D:\data\dsh\dsh-translator\build.mjs
+> ```
+
+「翻译」页签的**最底部**有一个输入框，用来看你说的这种情况：手里已经有一段文字（剪贴板里的、别处复制来的、自己想写的），不想为了翻译它先去对话里把它造出来再划选。
+
+| 操作 | 结果 |
+|---|---|
+| `Enter` | 把框里的内容当作**一条新引用**，走完全相同的翻译链路（分块、代码遮蔽、流式、缓存、卡片操作全都一样），卡片来源标记为「手动输入」 |
+| `Shift+Enter` | 换行，不提交 |
+| 右侧「翻译」按钮 | 与 `Enter` 等价（框空时禁用） |
+| 把文字**拖进输入框** | 暂存进输入框等你编辑，**不会**直接翻译（拖到面板其它地方仍然直接翻译） |
+| 框里是中文 / 只有空白 | 不提交，提示一下。空白是无操作 |
+| 输入法选词回车 | 不提交（`composing` 期间不认 Enter） |
+
+**「输入暂存」**：框里的内容按会话存在浏览器本地（`dsh-translator:draft:` 前缀 + 会话 id），每敲一个字就存一次。**刷新页面或切走再切回来，没提交的字还在**；成功提交后该条暂存被清掉（提交失败则保留，不让你丢字）。
+
+**它不是聊天框，这点是故意的。** 本插件的硬约束是"纯显示层"：它收集和显示的任何东西都不进会话日志、不进模型上下文。一个真聊天框会直接破坏这条。所以这个框干的事和浮动「译」按钮**完全一样**，只是入口换成了"我自己打"；它没有给模型开任何新的对话通道。
+
+要真正做聊天，得先决定要不要放弃"纯显示层"这条约束——那是另一个决定，不是这个 beta 的范围。
 
 ## 行为细节
 
@@ -342,7 +367,7 @@ curl.exe -N -X POST http://127.0.0.1:3080/dsh-translator/translate `
 
 ```powershell
 npm run build     # 构建 lib/client.js（浏览器半边）与 lib/index.js（宿主半边）
-npm test          # 86 个单测：文本策略 / SSE 分帧 / LRU / 宿主路由端到端 / 浏览器半边挂载 / 兼容性探针
+npm test          # 92 个单测：文本策略 / SSE 分帧 / LRU / 宿主路由端到端 / 浏览器半边挂载 / 兼容性探针 / 底部输入框
 npm run verify    # build + test + 产物契约校验（含 apply 真挂载、Config 禁令、inject 必须为空）
 npm run compat    # 离线核对：本插件绑定的服务/槽位在**当前装的** dsh 里是否都还在（升级 dsh 后先跑这个）
 ```
@@ -354,7 +379,8 @@ npm run compat    # 离线核对：本插件绑定的服务/槽位在**当前装
 - `test/client.test.mjs` 用假 DOM + React 桩**真挂载打包后的客户端 bundle**（就是 DSH 模块系统 `__ModuleLoader__.load` 那条路径），断言页签类型、两个槽位、设置项、快捷键监听都注册成功，并把「侧边栏页签渲染出一条已完成译文」也断言掉——客户端 `apply` 抛错会拖垮整个客户端组合，和宿主半边那次事故同类，所以这里对着真产物测。**假 context 也实现了 `inject(deps, cb)`**：服务齐了就同步跑回调，缺了就记为 parked，所以"缺服务只降级"这条也有回归测试守着。
 - `tools/check-dsh-compat.mjs` 是**升级 dsh 前的离线绊线**：它从构建产物里读出本插件绑定的每个服务名与槽位名，再去已安装的 `@deepseek-ai/*` 的 js/d.ts 里找同名字符串。命中不代表一定没错，但**一个名字彻底消失 = 下次开机就是那块 `Failed to load plugins`**。`test/compat.test.mjs` 用 `settingsScope`（0.1.7 真删掉的那个）当标本，保证这条绊线不是橡皮图章。
 - `tools/cdp-boot-probe.mjs` 用真 Chrome（CDP）回答最后一个问题：**页面到底起没起来**。判定标准是"输入框在、`#root` 有内容、body 里没有 `Failed to load plugins`"。起 headless Chrome 的完整命令见 `HANDOVER.md` §5。
-- `tools/cdp-full-flow.mjs` / `cdp-dump.mjs` / `cdp-dig.mjs` / `cdp-surface-audit.mjs`：端到端取证、DOM 大盘点、右栏结构深挖、划选命中率量化。
+- `tools/cdp-composer-flow.mjs`（beta 专属）：空面板也贴底 → 打字 → **刷新后草稿还在** → 真 Enter → 卡片出中文 → 输入框清空。截图落 .evidence/h0-empty.png / h1-composer.png / h2-committed.png。
+- `tools/cdp-full-flow.mjs` / cdp-dump.mjs / cdp-dig.mjs / cdp-surface-audit.mjs：端到端取证、DOM 大盘点、右栏结构深挖、划选命中率量化。
 
 ## 兼容性
 

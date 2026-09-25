@@ -23,7 +23,7 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 
-import { chunkText, classifySelection, maskCode, restoreCode } from '../shared/select.js'
+import { chunkText, classifySelection, looksChinese, maskCode, normalizeSelection, restoreCode } from '../shared/select.js'
 import { provenanceFor, readChatSnapshot } from './chat.js'
 import { FloatCard } from './FloatCard.jsx'
 import { translate } from './query.js'
@@ -130,7 +130,7 @@ const TAB_ID = 'dsh-translator'
  * identical from the outside; the `?dsht-debug=1` report prints this line so the
  * two can be told apart in one screenshot.
  */
-const BUNDLE_STAMP = 'client-2026-09-25T15:40Z-dsh017'
+const BUNDLE_STAMP = 'client-2026-09-25T16:30Z-dsh017-chatbox-beta'
 
 /** Tab title. */
 const TAB_TITLE = '翻译'
@@ -213,6 +213,28 @@ export function scopeBinding(ctx) {
  */
 export function sessionKeyOf(ctx) {
   return scopeSessionKey(ctx) ?? 'default'
+}
+
+/**
+ * Decide what the pane's bottom composer does with what the user typed.
+ *
+ * The composer is NOT the selection trigger, and the difference is the point: a
+ * selection has to clear a length floor (`MIN_SELECTION_CHARS`) because a stray
+ * click produces stray selections, whereas text someone deliberately typed is an
+ * instruction. So the floor is dropped here and only two things are refused — an
+ * empty box, and text that is already the target language.
+ *
+ * Pure and exported so the rule can be asserted directly instead of through a
+ * synthetic event.
+ *
+ * @param raw - the composer's current text.
+ * @returns `{action: 'blank'|'already-chinese'|'translate', text}`.
+ */
+export function classifyManualInput(raw) {
+  const text = normalizeSelection(raw)
+  if (text === '') return { action: 'blank', text }
+  if (looksChinese(text)) return { action: 'already-chinese', text }
+  return { action: 'translate', text }
 }
 
 /** Whether this page asked for the plugin's self-report (`?dsht-debug=1`). */
@@ -375,6 +397,32 @@ export function apply(ctx) {
     retry: (key) => {
       const ref = store.find(key)
       store.retry(key, translatorFor(ref?.text ?? '', ref?.kind ?? 'selection'))
+    },
+    /**
+     * Commit text typed into the pane's bottom composer as one more reference.
+     *
+     * Same destination as a selection (the shared `RefsStore` and the existing
+     * translate pipeline), different gate — see {@link classifyManualInput}. It
+     * returns a result object instead of a key because the composer has to tell the
+     * user WHY nothing happened; a silent no-op on Enter reads as a broken box.
+     *
+     * @param raw - the composer's text.
+     * @returns `{ok: true, key, text}` or `{ok: false, reason}`.
+     */
+    addManual: (raw) => {
+      const classified = classifyManualInput(raw)
+      if (classified.action === 'blank') return { ok: false, reason: 'blank' }
+      if (classified.action === 'already-chinese') return { ok: false, reason: 'already-chinese' }
+      const key = store.add(
+        {
+          text: classified.text,
+          kind: 'selection',
+          lang: language(),
+          sourceLabel: '手动输入',
+        },
+        translatorFor(classified.text, 'selection'),
+      )
+      return { ok: true, key, text: classified.text }
     },
     cancel: (key) => store.cancel(key),
     remove: (key) => store.remove(key),

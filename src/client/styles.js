@@ -64,7 +64,7 @@ const CSS = `
   color:var(--dsw-alias-label-secondary,#c9d2e0)}
 .${CLS}-acts button:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14))}
 .${CLS}-empty{display:flex;flex-direction:column;gap:6px;padding:14px 10px;align-items:center;text-align:center;
-  color:var(--dsw-alias-label-tertiary,#8a94a6);font-size:12px;line-height:1.8}
+  color:var(--dsw-alias-label-tertiary,#8a94a6);font-size:12px;line-height:1.8;flex:1;justify-content:center;min-height:0}
 .${CLS}-empty kbd{border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:5px;
   padding:0 5px;font-family:var(--ds-font-family-code,ui-monospace,monospace);font-size:11px}
 .${CLS}-float{position:fixed;right:18px;bottom:calc(96px + var(--dsh-input-offset,0px));width:min(420px,42vw);
@@ -76,6 +76,24 @@ const CSS = `
 .${CLS}-setting{display:flex;align-items:center;gap:10px;justify-content:space-between;
   padding:10px 2px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.16))}
 .${CLS}-setting small{display:block;color:var(--dsw-alias-label-tertiary,#8a94a6);font-size:11px;margin-top:2px}
+.${CLS}-composer{display:flex;align-items:flex-end;gap:6px;flex:none;padding-top:2px}
+.${CLS}-input{
+  flex:1;min-width:0;box-sizing:border-box;resize:vertical;
+  min-height:calc(2 * 1.6em + 12px);max-height:9em;overflow-y:auto;
+  border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.28));border-radius:10px;
+  background:var(--dsw-alias-interactive-bg,rgba(128,128,128,.06));
+  color:var(--dsw-alias-label-primary,#e6ebf2);
+  font:12px/1.6 var(--ds-font-family-body,system-ui,sans-serif);padding:5px 8px}
+.${CLS}-input:focus{outline:none;border-color:var(--dsw-static-deepseek-400,#679efe)}
+.${CLS}-input::placeholder{color:var(--dsw-alias-label-tertiary,#8a94a6)}
+.${CLS}-composer button{
+  flex:none;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.28));border-radius:10px;
+  background:transparent;color:var(--dsw-alias-label-secondary,#c9d2e0);
+  font:12px/1.4 var(--ds-font-family-body,system-ui,sans-serif);padding:5px 12px;cursor:pointer}
+.${CLS}-composer button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14))}
+.${CLS}-composer button:disabled{opacity:.45;cursor:default}
+.${CLS}-beta{border:1px solid var(--dsw-static-deepseek-400,#679efe);color:var(--dsw-static-deepseek-400,#679efe);
+  border-radius:999px;padding:0 6px;font-size:10px;letter-spacing:.04em;text-transform:uppercase}
 `
 
 /** Inject the stylesheet once per document. */
