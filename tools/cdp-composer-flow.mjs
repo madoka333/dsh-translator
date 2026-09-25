@@ -1,10 +1,13 @@
-// tools/cdp-composer-flow.mjs — beta 专属：右侧栏「翻译」页签**最底部输入框**的端到端取证。
+// tools/cdp-composer-flow.mjs — beta 专属端到端取证：底部输入框 + 语言对 x→y + 翻译挡位。
 //
-// 验的是四件事：
+// 验的是这些事：
 //   1. 输入框真的是面板的最后一个子节点（"最底下"这条需求本身）
 //   2. 聚焦 → 输入 → 真 Enter → 卡片出现且 sourceLabel 是「手动输入」、译文是中文
 //   3. 提交后输入框被清空
 //   4. 「输入暂存」：打一半不提交 → 刷新页面 → 重开页签 → 那段字还在
+//   5. 语言对是 x→y：两个下拉 + 中间箭头 + 交换按钮；交换在源为「自动检测」时把源钉成
+//      原目标、目标改成识别出来的语言；已被目标语言"覆盖"的卡片不会被重译成废话
+//   6. 挡位：切换后同一张卡片按新挡位重译，且卡片上写着自己的挡位
 //
 // 复用了 cdp-full-flow.mjs 里踩过坑的导航步骤（会话打开 / 右栏展开 / 点「翻译」页签）。
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -207,6 +210,82 @@ for (let i = 0; i < 40; i++) {
 note('05-after-enter', done);
 await shot('h2-committed.png');
 
+// ---- 6) the x→y pair, and the swap button's two behaviours ------------------
+// The pair is read off the real controls (data-role), not off the settings blob:
+// what matters is what the user can see and click.
+const pairFacts = () => run(`(() => {
+  const pane = document.querySelector('.dsht-pane');
+  if (!pane) return { pane: false };
+  const val = (role) => { const el = pane.querySelector('[data-role=' + role + ']'); return el ? el.value : null; };
+  const card = pane.querySelector('.dsht-card');
+  const arrow = pane.querySelector('.dsht-arrow');
+  return {
+    pane: true,
+    source: val('source'),
+    target: val('target'),
+    gear: val('mode'),
+    hasSwap: !!pane.querySelector('[data-role=swap]'),
+    arrow: arrow ? arrow.textContent.trim() : null,
+    sourceOptions: pane.querySelector('[data-role=source]') ? pane.querySelector('[data-role=source]').options.length : 0,
+    targetOptions: pane.querySelector('[data-role=target]') ? pane.querySelector('[data-role=target]').options.length : 0,
+    cardCount: pane.querySelectorAll('.dsht-card').length,
+    cardStatus: card ? (card.querySelector('.dsht-badge')?.getAttribute('data-state') ?? null) : null,
+    chip: card ? (card.querySelector('.dsht-langpair')?.innerText || '').replace(/\\s+/g, ' ').trim() : null,
+  };
+})()`);
+
+/** Set a select the way React sees it (native setter + change), then settle. */
+const setSelect = async (role, value) => {
+  const applied = await run(`(() => {
+    const el = document.querySelector('.dsht-pane [data-role=' + ${JSON.stringify(role)} + ']');
+    if (!el) return null;
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+    setter.call(el, ${JSON.stringify(value)});
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return el.value;
+  })()`);
+  await sleep(1200);
+  return applied;
+};
+
+const pairBefore = await pairFacts();
+note('06-pair-initial', pairBefore);
+const swapBox = await centerOf('.dsht-pane [data-role=swap]');
+if (swapBox?.visible) await clickAt(swapBox.x, swapBox.y);
+else await run(`document.querySelector('.dsht-pane [data-role=swap]')?.click()`);
+await sleep(1500);
+const pairSwapped = await pairFacts();
+note('06a-pair-swapped', pairSwapped);
+await shot('h4-swapped.png');
+// Back to the default pair through the SETTINGS + a reload, not through the
+// controls: the point here is to restore the starting state for the steps below
+// without paying for a re-translation of every card.
+await run(`(() => {
+  const key = 'dsh-translator:settings';
+  const s = JSON.parse(localStorage.getItem(key) || '{}');
+  s.sourceLanguage = 'auto';
+  s.targetLanguage = 'zh-CN';
+  localStorage.setItem(key, JSON.stringify(s));
+  return s;
+})()`);
+await send('Page.reload', { ignoreCache: true });
+await openTranslatorPane();
+const pairRestored = await pairFacts();
+note('06b-pair-restored', pairRestored);
+
+// ---- 7) the gear: switching it re-translates the cards under the new gear ----
+const gearBefore = await pairFacts();
+note('07-gear-before', gearBefore);
+await setSelect('mode', 'academic');
+let gearAfter = null;
+for (let i = 0; i < 40; i++) {
+  gearAfter = await pairFacts();
+  if (gearAfter?.cardStatus === 'done' && /学术/.test(gearAfter?.chip ?? '')) break;
+  await sleep(1000);
+}
+note('07a-gear-academic', gearAfter);
+await shot('h5-gear.png');
+
 // ---- 5b) fill the list, so the card/list design can be reviewed under load ----
 const MORE = ['Reasoning about the tradeoffs takes longer than the edit itself.', 'Latency matters more than throughput for an interactive panel.'];
 for (const text of MORE) {
@@ -266,11 +345,47 @@ if (!(listState?.composerBottom >= 0 && listState.composerBottom < 24)) {
 }
 if (Object.keys(storage ?? {}).length !== 0) failures.push(`a draft key survived the commit: ${JSON.stringify(storage)}`);
 
+// The x→y pair: the shape itself, then the swap semantics.
+if (pairBefore?.source !== 'auto') failures.push(`the source did not start on 自动检测 (got ${pairBefore?.source})`);
+if (pairBefore?.target !== 'zh-CN') failures.push(`the target did not start on Chinese (got ${pairBefore?.target})`);
+if (pairBefore?.gear !== 'general') failures.push(`the gear did not start on 通用 (got ${pairBefore?.gear})`);
+if (pairBefore?.arrow !== '→') failures.push(`the pair has no arrow between its two ends (got ${JSON.stringify(pairBefore?.arrow)})`);
+if (pairBefore?.hasSwap !== true) failures.push('the pair has no swap button');
+if (!(pairBefore?.sourceOptions >= 15)) failures.push(`the source list is short (${pairBefore?.sourceOptions} options)`);
+if (pairBefore?.targetOptions !== pairBefore?.sourceOptions - 1) {
+  failures.push('the target list must offer one language fewer: "auto" is not a language');
+}
+// Swapping with the source on 自动检测 pins the source and aims at what was
+// recognised (the card is English), which is the "now let me write back" gesture.
+if (pairSwapped?.source !== 'zh-CN') failures.push(`swap did not pin the source to the old target (got ${pairSwapped?.source})`);
+if (pairSwapped?.target !== 'en') failures.push(`swap did not aim at the recognised language (got ${pairSwapped?.target})`);
+// ...and it must NOT have re-translated the English card into English: that card
+// would have been refused as "already the target", so it is left as it is.
+if (pairSwapped?.cardCount !== 1) failures.push(`the swap changed the card count (${pairSwapped?.cardCount})`);
+if (!/English → 简体中文/.test(pairSwapped?.chip ?? '')) {
+  failures.push(`the card kept its own pair through a swap (chip=${JSON.stringify(pairSwapped?.chip)})`);
+}
+if (pairRestored?.source !== 'auto' || pairRestored?.target !== 'zh-CN') {
+  failures.push(`the pair did not survive a reload (got ${pairRestored?.source} → ${pairRestored?.target})`);
+}
+// The gear: one card, re-run under the new gear, chip updated, no duplicate.
+if (gearAfter?.gear !== 'academic') failures.push(`the gear select did not take (got ${gearAfter?.gear})`);
+if (gearAfter?.cardCount !== 1) failures.push(`the gear switch duplicated the card (${gearAfter?.cardCount})`);
+if (gearAfter?.cardStatus !== 'done') failures.push(`the card never finished under the new gear (${gearAfter?.cardStatus})`);
+if (!/→ 简体中文 · 学术/.test(gearAfter?.chip ?? '')) {
+  failures.push(`the card does not report its gear (chip=${JSON.stringify(gearAfter?.chip)})`);
+}
+
 console.log('--- exceptions ---');
 console.log(exceptions.length === 0 ? '(none)' : exceptions.slice(0, 3).join('\n'));
+// Close the CDP socket and LEAVE. The open WebSocket holds the event loop, so a
+// passing run that only prints its verdict never exits — which looks exactly like a
+// hung verification. The failure path below already exits for the same reason.
+ws.close();
 if (failures.length > 0) {
   console.log('COMPOSER FLOW FAILED:');
   for (const f of failures) console.log('  - ' + f);
   process.exit(1);
 }
 console.log('COMPOSER FLOW PASSED');
+process.exit(0);

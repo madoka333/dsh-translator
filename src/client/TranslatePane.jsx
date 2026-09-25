@@ -11,9 +11,105 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 
-import { LANGUAGE_CHOICES } from '../shared/select.js'
+import {
+  AUTO_DETECT_LABEL,
+  DEFAULT_MODE_ID,
+  DEFAULT_TARGET_CODE,
+  LANGUAGE_CHOICES,
+  SOURCE_AUTO,
+  TRANSLATION_MODES,
+  detectLanguage,
+  languageLabel,
+  modeById,
+  modeLabel,
+  normalizeSourceCode,
+} from '../shared/select.js'
 import { CLS } from './styles.js'
 import { readDraft, writeDraft } from './stores.js'
+
+/** The language pair a runtime reports, with the defaults filled in. */
+export function pairOf(runtime) {
+  return {
+    source: normalizeSourceCode(runtime?.sourceLanguage),
+    target: (() => {
+      const code = normalizeSourceCode(runtime?.targetLanguage)
+      return code === SOURCE_AUTO ? DEFAULT_TARGET_CODE : code
+    })(),
+  }
+}
+
+/** The gear a runtime reports, with the default filled in. */
+export function modeIdOf(runtime) {
+  return runtime?.mode ?? DEFAULT_MODE_ID
+}
+
+/**
+ * The toolbar tooltip for the swap button.
+ *
+ * The button does two different things and the user is entitled to know which
+ * one is about to happen: with a pinned source it exchanges the two sides, and
+ * with `自动检测` there is nothing to exchange — the source gets pinned to the
+ * current target and the target becomes the language we recognised, which is the
+ * "let me now write back" gesture.
+ *
+ * @param pair - `{source, target}`.
+ * @param detected - the last detected code, or null.
+ * @returns the tooltip text.
+ */
+export function swapHintOf(pair, detected) {
+  if (pair.source !== SOURCE_AUTO) {
+    return `交换：${languageLabel(pair.source)} ⇄ ${languageLabel(pair.target)}`
+  }
+  return `源语言为${AUTO_DETECT_LABEL}：点击后固定为${languageLabel(pair.target)}，目标语言改为${languageLabel(detected ?? 'en')}`
+}
+
+/** The gear dropdown's tooltip, including the empty-custom fallback. */
+export function modeHintOf(runtime) {
+  const id = modeIdOf(runtime)
+  const chosen = TRANSLATION_MODES.find((mode) => mode.id === id)
+  if (chosen === undefined) return modeById(id).hint
+  if (chosen.id === 'custom' && String(runtime?.customInstruction ?? '').trim() === '') {
+    return `${chosen.hint}（当前为空，按「通用」处理）`
+  }
+  return chosen.hint
+}
+
+/**
+ * The `source → target · gear` chip of one card.
+ *
+ * With `自动检测` the source is whatever the (pure, cheap) detector says about
+ * that card's own text — computed at render time rather than stored, so no card
+ * ever carries a stale guess and cards stored before this feature existed need
+ * no migration. An uncertain guess is marked with `?` instead of being hidden:
+ * the alternative is a chip that says "自动" on almost everything.
+ *
+ * @param ref - one reference.
+ * @returns `{text, title}` for the chip.
+ */
+export function langPairChip(ref) {
+  const target = languageLabel(ref?.lang ?? DEFAULT_TARGET_CODE)
+  const pinned = normalizeSourceCode(ref?.sourceLang)
+  let source = AUTO_DETECT_LABEL
+  let note = ''
+  if (pinned !== SOURCE_AUTO) {
+    source = languageLabel(pinned)
+    note = '源语言已指定'
+  } else {
+    const detected = detectLanguage(String(ref?.text ?? ''))
+    if (detected.code !== null) {
+      source = detected.certain ? detected.label : `${detected.label}?`
+      note = detected.certain ? '自动识别' : '自动识别（不太确定）'
+    } else {
+      note = '没能识别出源语言'
+    }
+  }
+  const gear = ref?.mode ?? DEFAULT_MODE_ID
+  const gearSuffix = gear === DEFAULT_MODE_ID ? '' : ` · ${modeLabel(gear)}`
+  return {
+    text: `${source} → ${target}${gearSuffix}`,
+    title: `${source} → ${target}${gearSuffix}（${note}）`,
+  }
+}
 
 /** Stable empty store used only by the title's no-store fallback. */
 const EMPTY_STORE = {
@@ -195,10 +291,14 @@ function modelLabel(route) {
 function RefCard({ item, onRetry, onRemove, onCancel, onCopy }) {
   const ref = item
   const [expanded, setExpanded] = useState(false)
+  const chip = langPairChip(ref)
   return (
     <div className={`${CLS}-card`} data-dsh-translator-ui="1" data-active={String(expanded)}>
       <div className={`${CLS}-meta`}>
         {ref.sourceLabel !== '' && <span>{ref.sourceLabel}</span>}
+        <span className={`${CLS}-langpair`} data-mode={ref.mode ?? DEFAULT_MODE_ID} title={chip.title}>
+          {chip.text}
+        </span>
         <span className={`${CLS}-spacer`} />
         {ref.kind === 'reasoning' && <span className={`${CLS}-badge`}>Think</span>}
         <span className={`${CLS}-badge`} data-state={ref.status}>
@@ -288,8 +388,8 @@ function Composer({ runtime, sessionKey, onNotice }) {
       onNotice?.(`已加入翻译（${[...(result.text ?? text)].length} 字）`)
       return
     }
-    if (result?.reason === 'already-chinese') {
-      onNotice?.('这段已经是中文了，没有送翻译')
+    if (result?.reason === 'same-language') {
+      onNotice?.(`这段已经是${languageLabel(runtime?.targetLanguage)}了，没有送翻译`)
       return
     }
     onNotice?.('没有可翻译的内容')
@@ -360,8 +460,10 @@ function Composer({ runtime, sessionKey, onNotice }) {
 
 /**
  * @param props - `{store, runtime, sessionKey}` where `runtime` is
- * `{addRef, addManual, retry, cancel, remove, clear, setLanguage, language}` and
- * `sessionKey` is the Session the pane is seated in.
+ * `{addRef, addManual, retry, cancel, remove, clear, setSourceLanguage,
+ * setTargetLanguage, setMode, swapLanguages, sourceLanguage, targetLanguage,
+ * mode, customInstruction, detected, shortcut}` and `sessionKey` is the Session
+ * the pane is seated in.
  *
  * `sessionKey` arrives as the slot's own `sessionId` prop: `sidebar.right.pane.tab`
  * is a `session`-scoped keyed slot, so the framework resolves it and no service
@@ -463,6 +565,10 @@ function failurePanel(message) {
 
 /** The pane's markup, kept separate so the caller can guard it in one place. */
 function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, handleCopy, composer }) {
+  const pair = pairOf(runtime)
+  const gear = modeIdOf(runtime)
+  const swapHint = swapHintOf(pair, runtime?.detected ?? null)
+  const gearHint = modeHintOf(runtime)
   return (
     <div
       className={`${CLS}-pane`}
@@ -476,15 +582,59 @@ function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, hand
       onDrop={onDrop}
     >
       <div className={`${CLS}-bar`}>
+        <span className={`${CLS}-pair`}>
+          <span className={`${CLS}-select`}>
+            <select
+              data-role="source"
+              value={pair.source}
+              title="源语言（自动检测：按文本脚本与常用词判断）"
+              onChange={(event) => runtime.setSourceLanguage?.(event.target.value)}
+            >
+              <option value={SOURCE_AUTO}>{AUTO_DETECT_LABEL}</option>
+              {LANGUAGE_CHOICES.map((choice) => (
+                <option key={choice.code} value={choice.code}>
+                  {choice.label}
+                </option>
+              ))}
+            </select>
+          </span>
+          <span className={`${CLS}-arrow`} aria-hidden="true">
+            →
+          </span>
+          <span className={`${CLS}-select`}>
+            <select
+              data-role="target"
+              value={pair.target}
+              title="目标语言"
+              onChange={(event) => runtime.setTargetLanguage?.(event.target.value)}
+            >
+              {LANGUAGE_CHOICES.map((choice) => (
+                <option key={choice.code} value={choice.code}>
+                  {choice.label}
+                </option>
+              ))}
+            </select>
+          </span>
+          <button
+            type="button"
+            className={`${CLS}-swap`}
+            data-role="swap"
+            title={swapHint}
+            onClick={() => runtime.swapLanguages?.()}
+          >
+            ⇄
+          </button>
+        </span>
         <span className={`${CLS}-select`}>
           <select
-            value={runtime.language}
-            title="目标语言"
-            onChange={(event) => runtime.setLanguage(event.target.value)}
+            data-role="mode"
+            value={gear}
+            title={gearHint}
+            onChange={(event) => runtime.setMode?.(event.target.value)}
           >
-            {LANGUAGE_CHOICES.map((choice) => (
-              <option key={choice.code} value={choice.code}>
-                {choice.label}
+            {TRANSLATION_MODES.map((mode) => (
+              <option key={mode.id} value={mode.id}>
+                {mode.label}
               </option>
             ))}
           </select>
@@ -506,7 +656,7 @@ function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, hand
           </div>
           <div className={`${CLS}-empty-lead`}>还没有引用。</div>
           <div>
-            在对话里<b>划选</b>英文 → 点 <b>译</b>
+            在对话里<b>划选</b>外文 → 点 <b>译</b>
           </div>
           <div>或在下面的输入框里打字、粘贴</div>
           <div>

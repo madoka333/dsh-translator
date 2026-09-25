@@ -1,8 +1,8 @@
 /**
  * Bounded LRU used by both halves of dsh-translator: the host keeps finished
- * translations keyed by (source, language, route), the browser keeps the ones it
- * has already rendered. Looking at the same paragraph twice is the normal case,
- * and a re-render must never cost another model call.
+ * translations keyed by (source, target language, gear, route), the browser keeps
+ * the ones it has already rendered. Looking at the same paragraph twice is the
+ * normal case, and a re-render must never cost another model call.
  *
  * Dependency-free and side-effect-free so it is directly unit-testable.
  *
@@ -65,13 +65,27 @@ export class LruCache {
 }
 
 /**
- * Cache key for one translation: the same source in the same language through the
- * same route always produces the same answer, so all three belong in the key.
+ * Cache key for one translation: the same source in the same language, through
+ * the same route, in the same gear, produces the same answer — so all of it
+ * belongs in the key.
+ *
+ * `mode` and `source` are the reason this plugin can promise that flipping the
+ * gear back and forth costs one call per (text, gear) and not one per flip: an
+ * academic answer must never be served for a general request.
+ *
  * @param text - the (already masked) source text.
  * @param target - the target language label.
  * @param route - `{provider, model}`.
+ * @param extra - `{mode, source, style}`; a missing triple means "the default
+ *   gear, no source hint, no custom requirement", which is exactly what a
+ *   pre-beta.2 caller meant. `style` carries the custom gear's own text, so
+ *   editing that requirement cannot serve an answer written under the old one.
  * @returns a collision-resistant composite key.
  */
-export function translationKey(text, target, route) {
-  return `${route?.provider ?? '?'}\u0000${route?.model ?? '?'}\u0000${target}\u0000${text}`
+export function translationKey(text, target, route, extra = {}) {
+  const part = (value) => (value === undefined || value === null ? '' : String(value))
+  const mode = part(extra?.mode)
+  const source = part(extra?.source)
+  const style = part(extra?.style)
+  return `${route?.provider ?? '?'}\u0000${route?.model ?? '?'}\u0000${target}\u0000${mode}\u0000${source}\u0000${style}\u0000${text}`
 }

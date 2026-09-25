@@ -82,6 +82,17 @@ ${TOKENS}
 .${CLS}-bar button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14))}
 .${CLS}-bar button:disabled{opacity:.45;cursor:default}
 .${CLS}-bar .${CLS}-spacer{flex:1}
+/* The x→y pair, then the gear: the shape every translation app uses, so the two
+   ends of a translation are read as one control instead of as "some dropdown".
+   The widths are clamp-ish on purpose — a sidebar can be dragged narrow, and a
+   select that cannot shrink pushes 清空 out of the row. */
+.${CLS}-pair{display:inline-flex;align-items:center;gap:4px;min-width:0}
+.${CLS}-bar .${CLS}-pair select{max-width:104px}
+.${CLS}-bar select[data-role=mode]{max-width:92px}
+.${CLS}-arrow{flex:none;color:var(--${CLS}-faint);font-size:11px;line-height:1}
+.${CLS}-bar .${CLS}-swap{flex:none;padding:4px 7px;font-size:12px;line-height:1.1}
+.${CLS}-bar .${CLS}-swap:hover{
+  color:var(--${CLS}-accent);border-color:color-mix(in srgb,var(--${CLS}-accent) 45%,transparent)}
 .${CLS}-count{
   color:var(--${CLS}-faint);font-size:11px;white-space:nowrap;
   border:1px solid var(--${CLS}-line);border-radius:999px;padding:1px 8px}
@@ -179,6 +190,13 @@ ${TOKENS}
   display:flex;align-items:center;gap:7px;font-size:11px;color:var(--${CLS}-faint);flex-wrap:wrap}
 .${CLS}-meta .${CLS}-spacer{flex:1}
 .${CLS}-meta>span:first-child{color:var(--${CLS}-dim);font-weight:500}
+/* The x→y chip of one card. It carries the pair in force at the moment that card
+   was translated, plus the gear when it is not the default one — which is the
+   only place that fact is visible after switching gears. */
+.${CLS}-langpair{
+  border:1px solid var(--${CLS}-line);border-radius:999px;padding:0 7px;line-height:1.6;
+  color:var(--${CLS}-faint);white-space:nowrap}
+.${CLS}-langpair:not([data-mode=general]){color:var(--${CLS}-dim);border-color:var(--${CLS}-line-strong)}
 .${CLS}-badge{border:1px solid var(--${CLS}-line);border-radius:999px;padding:0 7px;line-height:1.6}
 .${CLS}-badge[data-state=streaming]{color:var(--${CLS}-accent);border-color:currentColor}
 .${CLS}-badge[data-state=done]{color:var(--${CLS}-ok);border-color:currentColor}

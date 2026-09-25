@@ -23,13 +23,30 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 
-import { chunkText, classifySelection, looksChinese, maskCode, normalizeSelection, restoreCode } from '../shared/select.js'
+import {
+  DEFAULT_MODE_ID,
+  DEFAULT_TARGET_CODE,
+  SOURCE_AUTO,
+  chunkText,
+  classifySelection,
+  detectLanguage,
+  effectiveSource,
+  isKnownMode,
+  languageLabel,
+  languageVerdict,
+  maskCode,
+  nextPairAfterSource,
+  nextPairAfterTarget,
+  normalizeSelection,
+  restoreCode,
+  swapPair,
+} from '../shared/select.js'
 import { provenanceFor, readChatSnapshot } from './chat.js'
 import { FloatCard } from './FloatCard.jsx'
 import { translate } from './query.js'
 import { SelectionTrigger, pillAnchorFor } from './SelectionTrigger.jsx'
 import { SettingsRow } from './SettingsRow.jsx'
-import { RefsStore, SettingsStore } from './stores.js'
+import { RefsStore, LEGACY_MODE, LEGACY_SOURCE, SettingsStore } from './stores.js'
 import { installStyles } from './styles.js'
 import { TranslatePane, TranslateTitle, installErrorCapture, renderFailureLog } from './TranslatePane.jsx'
 import { watchSelection } from './watch.js'
@@ -130,7 +147,7 @@ const TAB_ID = 'dsh-translator'
  * identical from the outside; the `?dsht-debug=1` report prints this line so the
  * two can be told apart in one screenshot.
  */
-const BUNDLE_STAMP = 'client-2026-09-25T16:30Z-dsh017-chatbox-beta'
+const BUNDLE_STAMP = 'client-2026-09-26T03:20Z-dsh017-pair-modes-beta2'
 
 /** Tab title. */
 const TAB_TITLE = '翻译'
@@ -222,19 +239,23 @@ export function sessionKeyOf(ctx) {
  * selection has to clear a length floor (`MIN_SELECTION_CHARS`) because a stray
  * click produces stray selections, whereas text someone deliberately typed is an
  * instruction. So the floor is dropped here and only two things are refused — an
- * empty box, and text that is already the target language.
+ * empty box, and text that already IS the target language (which is now decided
+ * by the shared language verdict, so it follows the configured pair: with the
+ * target on English, English input is the pointless one, not Chinese).
  *
  * Pure and exported so the rule can be asserted directly instead of through a
  * synthetic event.
  *
  * @param raw - the composer's current text.
- * @returns `{action: 'blank'|'already-chinese'|'translate', text}`.
+ * @param policy - `{source, target}`; the language pair in force.
+ * @returns `{action: 'blank'|'same-language'|'translate', text}`.
  */
-export function classifyManualInput(raw) {
+export function classifyManualInput(raw, policy = {}) {
   const text = normalizeSelection(raw)
   if (text === '') return { action: 'blank', text }
-  if (looksChinese(text)) return { action: 'already-chinese', text }
-  return { action: 'translate', text }
+  const verdict = languageVerdict(text, policy)
+  if (verdict.same) return { action: 'same-language', text, reason: 'same-language', detected: verdict.detected }
+  return { action: 'translate', text, reason: 'ok', detected: verdict.detected }
 }
 
 /** Whether this page asked for the plugin's self-report (`?dsht-debug=1`). */
@@ -344,24 +365,98 @@ export function apply(ctx) {
     }
   }
 
-  const language = () => settings.getSnapshot().targetLanguage ?? 'zh-CN'
+  /** The language pair in force, read fresh — the settings are live. */
+  const pair = () => ({
+    source: settings.getSnapshot().sourceLanguage ?? SOURCE_AUTO,
+    target: settings.getSnapshot().targetLanguage ?? DEFAULT_TARGET_CODE,
+  })
+
+  /** The gear in force. */
+  const mode = () => settings.getSnapshot().mode ?? DEFAULT_MODE_ID
+
+  /** The text behind the `custom` gear. */
+  const instruction = () => settings.getSnapshot().customInstruction ?? ''
+
+  /** The policy every classification decision is made under. */
+  const policy = () => ({ source: pair().source, target: pair().target })
+
+  /** The spec stored on one card, with the pre-beta.2 defaults filled in. */
+  const specOf = (ref) => ({
+    lang: ref?.lang ?? DEFAULT_TARGET_CODE,
+    mode: ref?.mode ?? LEGACY_MODE,
+    sourceLang: ref?.sourceLang ?? LEGACY_SOURCE,
+  })
+
+  /**
+   * The most recent recognisable source language.
+   *
+   * Read from the newest card rather than remembered: the swap button needs
+   * "the language the user was just reading", and a variable would go stale the
+   * moment a card is deleted or restored from storage.
+   * @returns a detected code, or null.
+   */
+  const detectedNow = () => {
+    for (const ref of store.list()) {
+      const verdict = detectLanguage(ref.text)
+      if (verdict.certain) return verdict.code
+    }
+    return null
+  }
+
+  /**
+   * Re-run every card whose spec no longer matches the settings.
+   *
+   * Cards are NOT duplicated and NOT left alone: a gear or language change is a
+   * request to see the same texts under the new pair/gear, and because the page
+   * cache and the host cache are both keyed by (target, gear, source) the way
+   * back is a cache hit. A card that is already correct is skipped, so a
+   * no-op change costs nothing.
+   *
+   * A card whose TEXT is already the new target language is skipped too, and that
+   * is the interesting rule: the swap button exists for the next thing you type,
+   * so without it an English card would be re-run into English — a paid call to
+   * get the same sentence back. The card keeps its own pair, and its chip says so.
+   *
+   * The test is the DETECTED language of the card's text, deliberately not the
+   * declared source: a swap pins the source to the old target, so a card whose
+   * text is English would otherwise be "translated" from Chinese into English.
+   *
+   * @param patch - `{lang?, mode?, sourceLang?}` to commit before re-running.
+   */
+  const retranslateAll = (patch) => {
+    for (const ref of store.list()) {
+      const current = specOf(ref)
+      const want = { ...current, ...patch }
+      if (want.lang === current.lang && want.mode === current.mode && want.sourceLang === current.sourceLang) continue
+      const detected = detectLanguage(ref.text)
+      if (detected.certain && detected.code === want.lang) continue
+      store.retry(ref.key, translatorFor(ref.text, ref.kind), want)
+    }
+  }
 
   /** Build the translator face for one reference: chunking, masking, SSE. */
   function translatorFor(text, kind) {
     return {
       chunks: (value) => chunkText(value),
-      translate: async ({ text: unit, kind: unitKind, lang, signal, onStart, onDelta }) => {
+      translate: async ({ text: unit, kind: unitKind, lang, mode: unitMode, sourceLang, signal, onStart, onDelta }) => {
         const masking = (settings.getSnapshot().maskCode ?? true) ? maskCode(unit) : { text: unit, spans: [] }
         if (masking.text.trim() === '') {
           // The whole unit is code: keep the original untouched.
           onDelta?.(unit)
           return unit
         }
+        // Detected here, on exactly the text the host will receive and key its
+        // cache on, so the hint in the prompt and the cache key can never tell
+        // two different stories about the same request.
+        const gear = unitMode ?? mode()
         let whole = ''
         await translate({
           text: masking.text,
           kind: unitKind ?? kind,
           lang,
+          source: effectiveSource(masking.text, sourceLang),
+          mode: gear,
+          instruction: gear === 'custom' ? instruction() : '',
           signal,
           onStart,
           onDelta: (delta) => {
@@ -378,8 +473,19 @@ export function apply(ctx) {
 
   const runtime = {
     addRef: (text, meta = {}) => {
-      const classified = classifySelection(text)
-      if (classified.action === 'ignore') return null
+      const live = policy()
+      const classified = classifySelection(text, live)
+      // `noop` is refused as well as `ignore`: before, an already-Chinese
+      // selection that reached this path (the keyboard shortcut, a drag) was
+      // translated Chinese → Chinese, which is a paid no-op.
+      if (classified.action === 'ignore') {
+        console.warn('[dsh-translator] 选中的内容无需翻译（过短或为空），未创建引用')
+        return null
+      }
+      if (classified.action === 'noop') {
+        console.warn(`[dsh-translator] 选中的内容已经是目标语言（${languageLabel(live.target)}），未创建引用`)
+        return null
+      }
       // Provenance is decoration: `uiConversation` is read, not declared, so a
       // renamed service costs the card its turn/step label and nothing else.
       const snapshot = readChatSnapshot(serviceOf(ctx, 'uiConversation'), store.sessionKey())
@@ -388,7 +494,9 @@ export function apply(ctx) {
         {
           text: classified.text,
           kind: meta.kind ?? 'selection',
-          lang: language(),
+          lang: live.target,
+          mode: mode(),
+          sourceLang: live.source,
           sourceLabel: label,
         },
         translatorFor(classified.text, meta.kind ?? 'selection'),
@@ -410,14 +518,17 @@ export function apply(ctx) {
      * @returns `{ok: true, key, text}` or `{ok: false, reason}`.
      */
     addManual: (raw) => {
-      const classified = classifyManualInput(raw)
+      const live = policy()
+      const classified = classifyManualInput(raw, live)
       if (classified.action === 'blank') return { ok: false, reason: 'blank' }
-      if (classified.action === 'already-chinese') return { ok: false, reason: 'already-chinese' }
+      if (classified.action === 'same-language') return { ok: false, reason: 'same-language', target: live.target }
       const key = store.add(
         {
           text: classified.text,
           kind: 'selection',
-          lang: language(),
+          lang: live.target,
+          mode: mode(),
+          sourceLang: live.source,
           sourceLabel: '手动输入',
         },
         translatorFor(classified.text, 'selection'),
@@ -427,14 +538,49 @@ export function apply(ctx) {
     cancel: (key) => store.cancel(key),
     remove: (key) => store.remove(key),
     clear: () => store.clear(),
-    setLanguage: (lang) => {
-      settings.update({ targetLanguage: lang })
-      for (const ref of store.list()) {
-        if (ref.lang !== lang) store.retry(ref.key, translatorFor(ref.text, ref.kind))
-      }
+    /**
+     * Pick a source language. A pick that collides with the target moves the
+     * TARGET out of the way rather than deadlocking the pair (see
+     * `nextPairAfterSource`).
+     */
+    setSourceLanguage: (code) => {
+      const next = nextPairAfterSource(pair(), code, detectedNow())
+      settings.update({ sourceLanguage: next.source, targetLanguage: next.target })
+      retranslateAll({ sourceLang: next.source, lang: next.target })
     },
-    get language() {
-      return language()
+    /** Pick a target language; mirrors {@link runtime.setSourceLanguage}. */
+    setTargetLanguage: (code) => {
+      const next = nextPairAfterTarget(pair(), code, detectedNow())
+      settings.update({ sourceLanguage: next.source, targetLanguage: next.target })
+      retranslateAll({ sourceLang: next.source, lang: next.target })
+    },
+    /** Pick a translation gear and re-run the cards under it. */
+    setMode: (id) => {
+      const chosen = isKnownMode(id) ? id : DEFAULT_MODE_ID
+      settings.update({ mode: chosen })
+      retranslateAll({ mode: chosen })
+    },
+    /** Exchange the two sides (or pin the source and aim at what was detected). */
+    swapLanguages: () => {
+      const next = swapPair(pair(), detectedNow())
+      settings.update({ sourceLanguage: next.source, targetLanguage: next.target })
+      retranslateAll({ sourceLang: next.source, lang: next.target })
+    },
+    get sourceLanguage() {
+      return pair().source
+    },
+    get targetLanguage() {
+      return pair().target
+    },
+    get mode() {
+      return mode()
+    },
+    get customInstruction() {
+      return instruction()
+    },
+    /** The most recent recognisable source language (for the swap button). */
+    get detected() {
+      return detectedNow()
     },
     get shortcut() {
       return settings.getSnapshot().shortcut ?? ''
@@ -448,12 +594,10 @@ export function apply(ctx) {
       return
     }
     // `addRef` returns null when the text is not worth translating (too short,
-    // blank); that is reported so a click with no visible effect leaves a trail.
+    // blank, or already the target language) and says which on the console, so a
+    // click with no visible effect still leaves a trail.
     const key = runtime.addRef(text, meta ?? { kind: 'selection', sourceLabel: '划选内容' })
-    if (key === null) {
-      console.warn('[dsh-translator] 选中的内容无需翻译（过短或为空），未创建引用')
-      return
-    }
+    if (key === null) return
     openPane()
   }
 
@@ -461,10 +605,15 @@ export function apply(ctx) {
   // Neither needs a service: these run even when the sidebar half is absent, which
   // is what keeps the plugin useful in a composition without a right column.
   ctx.effect(() => {
-    const teardown = watchSelection((next) => {
-      lastSelection = next
-      rerender()
-    })
+    const teardown = watchSelection(
+      (next) => {
+        lastSelection = next
+        rerender()
+      },
+      // The pill's own verdict ("已经是目标语言了") has to follow the live pair:
+      // with the target on Japanese, a Japanese selection is the pointless one.
+      () => policy(),
+    )
     return teardown
   }, 'dsh-translator: selection watcher')
 
@@ -654,7 +803,9 @@ export function apply(ctx) {
       `tab id / kind : ${TAB_ID} / ${KIND}`,
       `seat keys     : body=${seatKeys.body} title=${seatKeys.title}`,
       `session       : ${store.sessionKey()}（来源: ${sessionSource}）`,
-      `refs          : ${store.list().length}（${store.list().map((ref) => `${ref.status}:${[...(ref.translation ?? '')].length}字`).join(', ') || '空'}）`,
+      `pair / gear   : ${pair().source === SOURCE_AUTO ? '自动检测' : languageLabel(pair().source)} → ${languageLabel(pair().target)} · ${runtime.mode}`,
+      `detected last : ${detectedNow() ?? '（无）'}`,
+      `refs          : ${store.list().length}（${store.list().map((ref) => `${ref.status}:${[...(ref.translation ?? '')].length}字:${ref.mode ?? LEGACY_MODE}`).join(', ') || '空'}）`,
       `slots.snapshot: ${describeSlot(slots, 'sidebar.right.pane.tab')}`,
       `slot.title    : ${describeSlot(slots, 'sidebar.right.pane.tab.title')}`,
       `tab types     : ${describeTabTypes(tabs)}`,

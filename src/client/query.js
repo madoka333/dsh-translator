@@ -56,7 +56,7 @@ function delay(ms, signal) {
  * so `fetch` was never reached and every card sat on "translating…" forever with
  * only a console error to show for it. Two names, two jobs.
  *
- * @param request - `{text, kind, lang, route?, signal, onStart, onDelta}`.
+ * @param request - `{text, kind, lang, source?, mode?, instruction?, route?, signal, onStart, onDelta}`.
  * @returns the complete translated text.
  * @throws {TranslateError} when the host or the model failed.
  */
@@ -100,6 +100,11 @@ async function attemptOnce(request) {
       text: request.text,
       kind: request.kind,
       lang: request.lang,
+      // The effective source (`null`/`'auto'` = "you decide"), the gear, and the
+      // custom gear's own text. All three are re-sanitized by the host.
+      ...(request.source === undefined || request.source === null ? {} : { source: request.source }),
+      ...(request.mode === undefined ? {} : { mode: request.mode }),
+      ...(request.instruction === undefined || request.instruction === '' ? {} : { instruction: request.instruction }),
       ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
       ...(request.route === undefined ? {} : { route: request.route }),
     }),

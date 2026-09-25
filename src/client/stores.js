@@ -27,13 +27,26 @@ const MAX_CACHE = 200
 
 /** Default settings; `targetLanguage` mirrors the host default. */
 export const DEFAULT_SETTINGS = {
+  /** Target language code. */
   targetLanguage: 'zh-CN',
+  /** Source language code, or `'auto'` (detect it from the text). */
+  sourceLanguage: 'auto',
+  /** Translation gear: a `TRANSLATION_MODES` id. */
+  mode: 'general',
+  /** Free-text requirement behind the `custom` gear. */
+  customInstruction: '',
   trigger: 'selection',
   shortcut: 'Ctrl+Shift+T',
   maskCode: true,
   includeReasoning: true,
   includeText: true,
 }
+
+/** The gear a card carries when it was stored before gears existed. */
+export const LEGACY_MODE = 'general'
+
+/** The source a card carries when it was stored before detection existed. */
+export const LEGACY_SOURCE = 'auto'
 
 /** Read one JSON blob from localStorage without throwing. */
 function readJson(key, fallback) {
@@ -98,12 +111,56 @@ class Observable {
   }
 }
 
-/** Stable identity of a reference: same text + same spec ⇒ same card. */
-export function refKey(text, spec, sessionKey) {
+/**
+ * Stable identity of a reference: one card per (Session, text).
+ *
+ * The language pair and the gear are NOT part of it any more. They used to be —
+ * a card was identified by the text plus the target language — but changing
+ * either one re-translates the cards in place (that is what makes a gear switch
+ * an A/B comparison instead of a pile of duplicates), so they describe the
+ * answer, not the card. Answer identity lives in {@link answerKeyOf}.
+ *
+ * @param text - the normalized source text.
+ * @param sessionKey - the storage namespace.
+ * @returns the card's key.
+ */
+export function refKey(text, sessionKey) {
   let hash = 5381
-  const input = `${sessionKey}\u0000${spec.language}\u0000${text}`
+  const input = `${sessionKey}\u0000${text}`
   for (let i = 0; i < input.length; i += 1) hash = ((hash << 5) + hash + input.charCodeAt(i)) | 0
   return `${(hash >>> 0).toString(36)}:${input.length}`
+}
+
+/**
+ * Identity of one ANSWER: same text, same target, same gear, same source hint ⇒
+ * the same translation, and the in-page cache must not confuse two of them.
+ *
+ * Mirror of the host's `translationKey`, minus the route (the browser does not
+ * care which model answered — a finished card is a finished card).
+ *
+ * @param spec - `{lang, mode, sourceLang}` as stored on the reference.
+ * @param text - the source text.
+ * @returns the cache key.
+ */
+export function answerKeyOf(spec, text) {
+  const mode = spec?.mode ?? LEGACY_MODE
+  const source = spec?.sourceLang ?? LEGACY_SOURCE
+  return `${spec?.lang ?? ''}\u0000${mode}\u0000${source}\u0000${text}`
+}
+
+/** The spec of one stored reference, with the pre-beta.2 defaults filled in. */
+export function specOfRef(ref) {
+  return {
+    lang: ref?.lang ?? '',
+    mode: ref?.mode ?? LEGACY_MODE,
+    sourceLang: ref?.sourceLang ?? LEGACY_SOURCE,
+  }
+}
+
+/** Whether a card already carries this exact pair and gear. */
+function sameSpec(spec, ref) {
+  const current = specOfRef(ref)
+  return spec.lang === current.lang && spec.mode === current.mode && spec.sourceLang === current.sourceLang
 }
 
 /** UI settings store, persisted under one localStorage key. */
@@ -157,8 +214,12 @@ export function writeDraft(sessionKey, text) {
 /**
  * One session's references plus the streaming machinery that fills them.
  *
- * A reference is `{key, text, kind, lang, status, translation, error, cached,
- * routeLabel, at, sourceLabel}`; `status ∈ pending|streaming|done|error|cancelled`.
+ * A reference is `{key, text, kind, lang, mode, sourceLang, status, translation,
+ * error, cached, routeLabel, at, sourceLabel}`; `lang` is the TARGET language,
+ * `sourceLang` is the pinned source or `'auto'`, and
+ * `status ∈ pending|streaming|done|error|cancelled`. Cards stored before
+ * beta.2 have no `mode`/`sourceLang`; they read back as the default gear and
+ * `'auto'` rather than being dropped.
  */
 export class RefsStore extends Observable {
   #cache = new Map()
@@ -181,7 +242,7 @@ export class RefsStore extends Observable {
     this.#abortAll()
     this.#sessionKey = key
     const stored = readJson(`${REFS_PREFIX}${key}`, { refs: [] })
-    const refs = Array.isArray(stored?.refs) ? stored.refs.filter(isStoredRef) : []
+    const refs = Array.isArray(stored?.refs) ? stored.refs.filter(isStoredRef).map(normalizeStoredRef) : []
     this.commit({ refs: refs.slice(0, MAX_REFS), active: refs[0]?.key ?? null })
   }
 
@@ -212,34 +273,44 @@ export class RefsStore extends Observable {
   /**
    * Add one reference (deduplicated): an already-known text is revealed and
    * re-raised to the top instead of duplicated.
-   * @param input - `{text, kind, lang, sourceLabel}`.
-   * @param translator - `{translate}` runner.
+   * @param input - `{text, kind, lang, mode, sourceLang, sourceLabel}`.
+   * @param translator - `{chunks, translate}` runner.
    * @returns the reference key.
    */
   add(input, translator) {
+    const key = refKey(input.text, this.#sessionKey)
     const spec = {
-      language: input.lang,
+      lang: input.lang,
+      mode: input.mode ?? LEGACY_MODE,
+      sourceLang: input.sourceLang ?? LEGACY_SOURCE,
     }
-    const key = refKey(input.text, spec, this.#sessionKey)
     const existing = this.find(key)
     if (existing !== undefined) {
       // Same text again: reveal the card instead of duplicating it. When its answer
       // is already in hand (finished once, or restored from storage), say so — the
       // card is the user's only evidence that this cost nothing.
-      const answer = this.#cache.get(key)
-      const known = answer !== undefined && answer !== ''
-      if (known) this.#patch(key, { translation: answer, status: 'done', error: null, cached: true })
+      if (sameSpec(spec, existing)) {
+        const answer = this.#cache.get(answerKeyOf(spec, input.text))
+        const known = answer !== undefined && answer !== ''
+        if (known) this.#patch(key, { translation: answer, status: 'done', error: null, cached: true })
+        this.#raise(key)
+        if (existing.status === 'error' || existing.status === 'cancelled') this.retry(key, translator)
+        return key
+      }
+      // The card exists under a DIFFERENT pair/gear (the user changed the toolbar
+      // and then re-selected the same text): keep one card per text, and let it
+      // follow the current settings instead of showing an answer from the old gear.
       this.#raise(key)
-      if (existing.status === 'error' || existing.status === 'cancelled') this.retry(key, translator)
+      this.retry(key, translator, spec)
       return key
     }
 
-    const cached = this.#cache.get(key)
+    const cached = this.#cache.get(answerKeyOf(spec, input.text))
     const ref = {
       key,
       text: input.text,
       kind: input.kind ?? 'selection',
-      lang: input.lang,
+      ...spec,
       sourceLabel: input.sourceLabel ?? '',
       status: cached === undefined ? 'pending' : 'done',
       translation: cached ?? '',
@@ -257,12 +328,20 @@ export class RefsStore extends Observable {
 
   /**
    * Re-run one reference from scratch.
+   *
+   * `patch` is how a language-pair or gear change reaches the card: the new spec
+   * MUST be written onto the reference BEFORE `#run` reads it, because `#run`
+   * takes the target, the gear and the source hint from the reference — retrying
+   * without patching re-requests the OLD language, which is a silent no-op from
+   * the user's side.
+   *
    * @param key - reference key.
-   * @param translator - `{translate}` runner.
+   * @param translator - `{chunks, translate}` runner.
+   * @param patch - spec fields to commit before running (`{lang, mode, sourceLang}`).
    */
-  retry(key, translator) {
+  retry(key, translator, patch = {}) {
     this.#abortOne(key)
-    this.#patch(key, { status: 'pending', translation: '', error: null, cached: false })
+    this.#patch(key, { status: 'pending', translation: '', error: null, cached: false, ...patch })
     this.#run(key, translator)
   }
 
@@ -275,7 +354,8 @@ export class RefsStore extends Observable {
   /** Remove one reference and forget its cached result. */
   remove(key) {
     this.#abortOne(key)
-    this.#cache.delete(key)
+    const victim = this.find(key)
+    if (victim !== undefined) this.#cache.delete(answerKeyOf(victim, victim.text))
     const refs = this.list().filter((ref) => ref.key !== key)
     this.commit({ refs, active: refs[0]?.key ?? null })
     this.#persist()
@@ -321,6 +401,8 @@ export class RefsStore extends Observable {
           text: unit,
           kind: ref.kind,
           lang: ref.lang,
+          mode: ref.mode ?? LEGACY_MODE,
+          sourceLang: ref.sourceLang ?? LEGACY_SOURCE,
           signal: controller.signal,
           onStart: (info) => {
             this.#patch(key, { routeLabel: info.label })
@@ -337,7 +419,7 @@ export class RefsStore extends Observable {
       // Chunks are joined BETWEEN each other only: appending after the last one
       // left a trailing blank line in every multi-chunk answer.
       const accumulated = pieces.filter((piece) => piece !== '').join('\n\n')
-      this.#cache.set(key, accumulated.trim())
+      this.#cache.set(answerKeyOf(ref, ref.text), accumulated.trim())
       while (this.#cache.size > MAX_CACHE) {
         const oldest = this.#cache.keys().next()
         if (oldest.done === true) break
@@ -407,4 +489,17 @@ function isStoredRef(value) {
     typeof value.text === 'string' &&
     typeof value.lang === 'string'
   )
+}
+
+/**
+ * Fill the fields a card written before beta.2 cannot have.
+ *
+ * The alternative — defaulting on every read — means a card whose gear is
+ * `undefined` in one code path and `'general'` in another, and the spec
+ * comparison that decides whether to re-translate uses exactly those fields.
+ * @param ref - one persisted reference.
+ * @returns the same reference with `mode` and `sourceLang` present.
+ */
+function normalizeStoredRef(ref) {
+  return { ...ref, mode: ref.mode ?? LEGACY_MODE, sourceLang: ref.sourceLang ?? LEGACY_SOURCE }
 }

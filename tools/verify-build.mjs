@@ -95,6 +95,9 @@ assert.equal('Config' in host, false, 'host must not export a Config schema')
 
 const defaults = host.resolveConfig({})
 assert.equal(defaults.targetLanguage, 'zh-CN')
+assert.equal(defaults.sourceLanguage, 'auto', 'the source defaults to detection')
+assert.equal(defaults.mode, 'general', 'the default gear')
+assert.equal(defaults.customInstruction, '')
 assert.equal(defaults.timeoutMs, 30_000)
 assert.equal(defaults.maxOutputTokens, 4096)
 assert.equal(defaults.cacheSize, 500)
@@ -115,6 +118,10 @@ const rejections = [
   [{ cacheSize: -1 }, /cacheSize must be an integer/],
   [{ verbose: 'yes' }, /verbose must be a boolean/],
   [{ targetLanguage: '' }, /targetLanguage must be a non-empty string/],
+  [{ mode: 'nonsense' }, /not a known translation mode/],
+  [{ sourceLanguage: 'nonsense' }, /is not a known language code/],
+  [{ sourceLanguage: 'en', targetLanguage: 'en' }, /must differ/],
+  [{ customInstruction: 'x'.repeat(401) }, /at most 400 characters/],
 ]
 for (const [value, pattern] of rejections) {
   assert.throws(() => host.resolveConfig(value), pattern, `config ${JSON.stringify(value)} must be rejected`)

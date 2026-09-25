@@ -22,6 +22,7 @@ import test, { afterEach } from 'node:test'
 
 import { handleMouseDown, isOwnUiNode, watchSelection } from '../src/client/watch.js'
 import { CLS } from '../src/client/styles.js'
+import { LANGUAGE_CHOICES, SOURCE_AUTO, TRANSLATION_MODES } from '../src/shared/select.js'
 
 /**
  * Effects the React stub collected during the last component render.
@@ -666,16 +667,7 @@ test('a sidebar that refuses its tab type degrades to the floating card', async 
 test('the pane re-scopes the store to the Session it is seated in', async () => {
   const { exports } = await mount()
   const { RefsStore } = await import('../src/client/stores.js')
-  const runtime = {
-    addRef: () => {},
-    retry: () => {},
-    cancel: () => {},
-    remove: () => {},
-    clear: () => {},
-    setLanguage: () => {},
-    language: 'zh-CN',
-    shortcut: 'Ctrl+Shift+T',
-  }
+  const { runtime } = paneRuntime()
 
   const store = new RefsStore('session-1')
   capturedEffects.length = 0
@@ -753,26 +745,69 @@ function readStagedDraft(sessionKey) {
   return globalThis.localStorage.getItem(`dsh-translator:draft:${sessionKey}`)
 }
 
-/** A runtime spy whose `addManual` answers with `result`. */
-function composerRuntime(result = { ok: true, key: 'k1', text: 'x' }) {
-  const calls = { manual: [], refs: [] }
+/**
+ * A runtime spy shaped like the real one the pane receives.
+ *
+ * The pane's toolbar reads `sourceLanguage` / `targetLanguage` / `mode` through
+ * GETTERS and calls four setters, so a fake that carries `language`/`setLanguage`
+ * would let a regression in that contract pass unnoticed.
+ * @param overrides - `{runtime, state}` merges.
+ */
+function paneRuntime(overrides = {}) {
+  const calls = { refs: [], manual: [], source: [], target: [], mode: [], swaps: 0, retry: [], remove: [], cancel: [], clear: 0 }
+  const state = {
+    sourceLanguage: 'auto',
+    targetLanguage: 'zh-CN',
+    mode: 'general',
+    customInstruction: '',
+    detected: 'en',
+    ...overrides.state,
+  }
   return {
     calls,
+    state,
     runtime: {
       addRef: (text) => calls.refs.push(text),
+      retry: (key) => calls.retry.push(key),
+      cancel: (key) => calls.cancel.push(key),
+      remove: (key) => calls.remove.push(key),
+      clear: () => (calls.clear += 1),
+      setSourceLanguage: (code) => calls.source.push(code),
+      setTargetLanguage: (code) => calls.target.push(code),
+      setMode: (id) => calls.mode.push(id),
+      swapLanguages: () => (calls.swaps += 1),
+      get sourceLanguage() {
+        return state.sourceLanguage
+      },
+      get targetLanguage() {
+        return state.targetLanguage
+      },
+      get mode() {
+        return state.mode
+      },
+      get customInstruction() {
+        return state.customInstruction
+      },
+      get detected() {
+        return state.detected
+      },
+      shortcut: 'Ctrl+Shift+T',
+      ...overrides.runtime,
+    },
+  }
+}
+
+/** A runtime spy whose `addManual` answers with `result`. */
+function composerRuntime(result = { ok: true, key: 'k1', text: 'x' }) {
+  const { calls, runtime } = paneRuntime({
+    runtime: {
       addManual: (text) => {
         calls.manual.push(text)
         return { ...result, text: result.text ?? text }
       },
-      retry: () => {},
-      cancel: () => {},
-      remove: () => {},
-      clear: () => {},
-      setLanguage: () => {},
-      language: 'zh-CN',
-      shortcut: 'Ctrl+Shift+T',
     },
-  }
+  })
+  return { calls, runtime }
 }
 
 const EMPTY_SNAPSHOT_STORE = { getSnapshot: () => ({ refs: [], active: null }), subscribe: () => () => {} }
@@ -780,15 +815,25 @@ const EMPTY_SNAPSHOT_STORE = { getSnapshot: () => ({ refs: [], active: null }), 
 test('classifyManualInput drops the selection length floor but keeps the two real refusals', async () => {
   const { exports } = await mount()
   const { classifyManualInput } = exports
-  assert.equal(classifyManualInput('   ').action, 'blank')
-  assert.equal(classifyManualInput('').action, 'blank')
-  assert.equal(classifyManualInput('这段话已经是中文了').action, 'already-chinese')
+  const zh = { source: 'auto', target: 'zh-CN' }
+  assert.equal(classifyManualInput('   ', zh).action, 'blank')
+  assert.equal(classifyManualInput('', zh).action, 'blank')
+  assert.equal(classifyManualInput('这段话已经是中文了', zh).action, 'same-language')
   // A typo-length English input is an instruction, not a stray selection: the
   // 8-character floor that guards the trigger must NOT apply here.
-  assert.deepEqual(classifyManualInput('  OK  '), { action: 'translate', text: 'OK' })
-  const long = classifyManualInput('Let me check\r\n\r\n\r\nthe layout.')
+  assert.equal(classifyManualInput('  OK  ', zh).action, 'translate')
+  assert.equal(classifyManualInput('  OK  ', zh).text, 'OK', 'and it is normalized')
+  const long = classifyManualInput('Let me check\r\n\r\n\r\nthe layout.', zh)
   assert.equal(long.action, 'translate')
   assert.equal(long.text, 'Let me check\n\nthe layout.', 'the text is normalized like a selection')
+  // The refusal follows the PAIR, not "Chinese": with the target on English it is
+  // English input that is pointless, and Chinese input that must go through.
+  const en = { source: 'auto', target: 'en' }
+  assert.equal(classifyManualInput('Let me check the layout first.', en).action, 'same-language')
+  assert.equal(classifyManualInput('这段话已经是中文了', en).action, 'translate')
+  // A pinned source equal to the target is a dead pair, and the composer says so
+  // instead of sending a request nothing can change.
+  assert.equal(classifyManualInput('Let me check the layout first.', { source: 'en', target: 'en' }).action, 'same-language')
 })
 
 test('the composer sits at the very bottom of the pane, under the drop strip', async () => {
@@ -862,7 +907,7 @@ test('Shift+Enter, IME Enter, a modifier, and an empty box all refuse to commit'
 test('a refused commit keeps the draft so the user does not lose their text', async () => {
   const { exports } = await mount()
   seedDraft('session-A', 'Let me check the repository layout first.')
-  const { runtime, calls } = composerRuntime({ ok: false, reason: 'already-chinese' })
+  const { runtime, calls } = composerRuntime({ ok: false, reason: 'same-language' })
   const tree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime, sessionKey: 'session-A' })
   composerInput(tree).props.onKeyDown(keyEvent('Enter'))
 
@@ -903,6 +948,156 @@ test('a draft is per Session, and dropping text stages it instead of translating
 })
 
 // ---------------------------------------------------------------------------
+// beta.2: the x→y pair and the translation gears.
+//
+// The toolbar used to be a single "target language" dropdown. It is now the
+// shape every translation app uses — [source] → [target] [swap] — plus a gear,
+// and each of those four controls has to reach its own runtime setter: a swap
+// button wired to the target setter would look right and be wrong.
+// ---------------------------------------------------------------------------
+
+/** One element of a rendered tree by `data-role`. */
+function roleElement(tree, role) {
+  return findElement(tree, (node) => node?.props?.['data-role'] === role)
+}
+
+/**
+ * Every host element of a rendered tree, in document order.
+ *
+ * Function components are invoked the way React would, so a control wrapped in a
+ * helper component is still found — `findElement` stops at the first match, and
+ * these assertions are about ORDER.
+ * @param node - the tree (or any sub-node).
+ * @param out - accumulator.
+ * @param depth - recursion guard.
+ * @returns the collected elements.
+ */
+function allElements(node, out = [], depth = 0) {
+  if (depth > 40 || node === null || node === undefined) return out
+  // A mapped list arrives as ONE nested array child, which is how React's own
+  // `createElement` treats it too.
+  if (Array.isArray(node)) {
+    for (const child of node) allElements(child, out, depth + 1)
+    return out
+  }
+  if (typeof node !== 'object') return out
+  if (typeof node.type === 'function') {
+    allElements(node.type(node.props ?? {}), out, depth + 1)
+    return out
+  }
+  out.push(node)
+  for (const child of node.children ?? []) allElements(child, out, depth + 1)
+  return out
+}
+
+/** Every `data-role` in the toolbar, in document order. */
+function barRoles(tree) {
+  const bar = tree.children.find((child) => child?.props?.className === `${CLS}-bar`)
+  assert.ok(bar !== undefined, 'the pane must render its toolbar')
+  return allElements(bar)
+    .map((child) => child.props?.['data-role'])
+    .filter((role) => role !== undefined)
+}
+
+test('the toolbar is a language pair, a swap button and a gear — in that order', async () => {
+  const { exports } = await mount()
+  const tree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime: paneRuntime().runtime })
+
+  assert.deepEqual(barRoles(tree), ['source', 'target', 'swap', 'mode'], 'the pair comes before the gear')
+
+  const source = roleElement(tree, 'source')
+  const target = roleElement(tree, 'target')
+  const mode = roleElement(tree, 'mode')
+  assert.equal(source.props.value, 'auto', 'the source starts on 自动检测')
+  assert.equal(target.props.value, 'zh-CN', 'and the target on Chinese')
+  assert.equal(mode.props.value, 'general')
+  // The source list offers 自动检测 FIRST, then the languages; the target list
+  // must NOT offer it at all (a target of "auto" is not a language).
+  const codes = (element) =>
+    allElements(element)
+      .filter((node) => node.type === 'option')
+      .map((node) => node.props.value)
+  assert.deepEqual(codes(source), [SOURCE_AUTO, ...LANGUAGE_CHOICES.map((choice) => choice.code)])
+  assert.deepEqual(codes(target), LANGUAGE_CHOICES.map((choice) => choice.code))
+  assert.deepEqual(codes(mode), TRANSLATION_MODES.map((entry) => entry.id))
+  assert.ok(renderText(source.children[0]).includes('自动检测'), 'the first source option is labelled')
+})
+
+test('each toolbar control reaches its own runtime setter', async () => {
+  const { exports } = await mount()
+  const { runtime, calls } = paneRuntime()
+  const tree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime })
+
+  roleElement(tree, 'source').props.onChange({ target: { value: 'fr' } })
+  roleElement(tree, 'target').props.onChange({ target: { value: 'ja' } })
+  roleElement(tree, 'mode').props.onChange({ target: { value: 'literary' } })
+  roleElement(tree, 'swap').props.onClick()
+
+  assert.deepEqual(calls.source, ['fr'])
+  assert.deepEqual(calls.target, ['ja'])
+  assert.deepEqual(calls.mode, ['literary'])
+  assert.equal(calls.swaps, 1, 'the swap button swaps; it does not silently set the target')
+})
+
+test('the swap button explains which of its two behaviours is about to run', async () => {
+  const { exports } = await mount()
+  const auto = exports.TranslatePaneExport({
+    store: EMPTY_SNAPSHOT_STORE,
+    runtime: paneRuntime({ state: { sourceLanguage: 'auto', targetLanguage: 'zh-CN', detected: 'en' } }).runtime,
+  })
+  const autoHint = roleElement(auto, 'swap').props.title
+  assert.ok(autoHint.includes('自动检测'), `the auto hint must say so (got: ${autoHint})`)
+  assert.ok(autoHint.includes('English'), 'and name the language it will aim at')
+
+  const pinned = exports.TranslatePaneExport({
+    store: EMPTY_SNAPSHOT_STORE,
+    runtime: paneRuntime({ state: { sourceLanguage: 'en', targetLanguage: 'zh-CN' } }).runtime,
+  })
+  assert.ok(roleElement(pinned, 'swap').props.title.includes('English'), 'a pinned pair explains the exchange')
+})
+
+test('the gear dropdown names the fallback when the custom requirement is empty', async () => {
+  const { exports } = await mount()
+  const empty = paneRuntime({ state: { mode: 'custom', customInstruction: '' } })
+  const tree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime: empty.runtime })
+  assert.ok(roleElement(tree, 'mode').props.title.includes('通用'), 'an empty custom gear says it falls back')
+
+  const filled = paneRuntime({ state: { mode: 'custom', customInstruction: '保留命令原文' } })
+  const filledTree = exports.TranslatePaneExport({ store: EMPTY_SNAPSHOT_STORE, runtime: filled.runtime })
+  const hint = roleElement(filledTree, 'mode').props.title
+  assert.ok(!hint.includes('当前为空'), `a filled custom gear is not called empty (got: ${hint})`)
+})
+
+test('a card carries its own x→y chip: pinned, detected, uncertain and gear', async () => {
+  const { exports } = await mount()
+  const cards = [
+    { key: 'a', text: 'Let me check the repository layout first.', lang: 'zh-CN', mode: 'general', sourceLang: 'auto' },
+    { key: 'b', text: 'Let me check the repository layout first.', lang: 'zh-CN', mode: 'academic', sourceLang: 'en' },
+    { key: 'c', text: 'Kubernetes deployment strategy', lang: 'zh-CN', mode: 'general', sourceLang: 'auto' },
+    { key: 'd', text: '我先看一下仓库结构，再决定改哪里。', lang: 'ja', mode: 'literal', sourceLang: 'auto' },
+  ].map((ref) => ({
+    ...ref,
+    kind: 'selection',
+    sourceLabel: '',
+    status: 'done',
+    translation: 'x',
+    error: null,
+    cached: false,
+    routeLabel: '',
+    at: 0,
+  }))
+  const store = { getSnapshot: () => ({ refs: cards, active: 'a' }), subscribe: () => () => {} }
+  const tree = exports.TranslatePaneExport({ store, runtime: paneRuntime().runtime })
+  const chips = allElements(tree).filter((node) => node.props?.className === `${CLS}-langpair`)
+  assert.deepEqual(
+    chips.map((chip) => renderText(chip.children)),
+    ['English → 简体中文', 'English → 简体中文 · 学术', '自动检测 → 简体中文', '简体中文 → 日本語 · 直译'],
+    'each card reports the pair it was translated under, and its gear when it is not the default',
+  )
+  assert.ok(chips[2].props.title.includes('没能识别出源语言'), 'an unprovable source says so instead of guessing')
+})
+
+// ---------------------------------------------------------------------------
 // Stylesheet integrity.
 //
 // The whole sheet is ONE template literal in `src/client/styles.js`, so a backtick
@@ -922,6 +1117,13 @@ test('the installed stylesheet arrives intact, not truncated by a stray backtick
   assert.ok(css.includes(`.${CLS}-trigger{`), 'the FIRST rule must survive')
   assert.ok(css.includes('@media (prefers-reduced-motion:reduce)'), 'the LAST rule must survive')
   assert.ok(css.includes(`.${CLS}-composer{`), 'and the composer rule must be there')
+  // beta.2's controls: the pair, the swap button and the card chip. A rule that
+  // silently disappears leaves unstyled controls that still "work", which is the
+  // hardest kind of breakage to notice in a screenshot.
+  for (const rule of [`-pair{`, `-arrow{`, `-swap{`, `-langpair{`]) {
+    assert.ok(css.includes(`.${CLS}${rule}`), `the ${rule} rule must be in the sheet`)
+  }
+  assert.ok(css.includes(`.${CLS}-bar select[data-role=mode]{`), 'the gear select needs its own width')
   // A stray `}` on the dragover selector was a real defect: the browser skips a
   // malformed rule, so the drag hint silently lost its highlight while the sheet
   // still looked fine. Balance alone would pass with a rule dropped and another
@@ -967,6 +1169,8 @@ test('the pane and title render a finished reference with its translation', asyn
     text: 'Let me check the repository layout first.',
     kind: 'selection',
     lang: 'zh-CN',
+    mode: 'academic',
+    sourceLang: 'auto',
     sourceLabel: '划选内容',
     status: 'done',
     translation: '我先看一下仓库结构。',
@@ -979,16 +1183,7 @@ test('the pane and title render a finished reference with its translation', asyn
     getSnapshot: () => ({ refs: [reference], active: 'k1' }),
     subscribe: () => () => {},
   }
-  const runtime = {
-    addRef: () => {},
-    retry: () => {},
-    cancel: () => {},
-    remove: () => {},
-    clear: () => {},
-    setLanguage: () => {},
-    language: 'zh-CN',
-    shortcut: 'Ctrl+Shift+T',
-  }
+  const { runtime } = paneRuntime()
 
   assert.equal(typeof exports.TranslatePaneExport, 'function', 'the pane must be exported for direct rendering')
   const paneText = renderText(exports.TranslatePaneExport({ store, runtime }))
@@ -996,6 +1191,9 @@ test('the pane and title render a finished reference with its translation', asyn
   assert.ok(paneText.includes('1 条引用'), 'the toolbar reports one reference')
   assert.ok(paneText.includes('完成'), 'the card reports its finished status')
   assert.ok(!paneText.includes('还没有引用'), 'the empty state is gone once a reference exists')
+  // The x→y chip: this card was translated into Chinese from an auto-detected
+  // English source, in the academic gear — all three facts, on the card.
+  assert.ok(paneText.includes('English → 简体中文 · 学术'), `the card shows its own pair and gear (got: ${paneText})`)
 
   // Regression: the card component used to take its data through a prop NAMED
   // `ref` (`<RefCard ref={ref} …>`). `ref` is reserved, so React consumed the
@@ -1145,11 +1343,12 @@ test('the floating pill survives a press and commits on the click that follows',
   // A "noop" candidate (already Chinese) renders a disabled pill that explains
   // itself instead of spending a model call.
   const noop = trigger({
-    candidate: { ...candidate, action: 'noop', reason: 'already-chinese' },
+    candidate: { ...candidate, action: 'noop', reason: 'same-language', shortLabel: '中文', targetLabel: '简体中文' },
     onCommit: (text, meta) => committed.push({ text, meta }),
     onDismiss: () => dismissed.push(true),
   })
-  assert.equal(noop.props.draggable, false, 'an already-Chinese selection is not draggable as a reference')
+  assert.equal(noop.props.draggable, false, 'an already-target-language selection is not draggable as a reference')
+  assert.ok(renderText(noop).includes('已是中文'), 'and the pill names the REAL target language')
   noop.props.onClick({ preventDefault() {}, stopPropagation() {} })
   assert.equal(committed.length, 1, 'the noop pill does not request a translation')
 })
@@ -1255,6 +1454,256 @@ test('a failing translation marks the card and keeps whatever arrived', async ()
 })
 
 // ---------------------------------------------------------------------------
+// beta.2: the spec a card is translated under.
+//
+// One card per (session, text) — but the pair and the gear are part of the
+// REQUEST, so changing them has to reach the request. The bug this guards is
+// silent: `retry()` used to re-run a card without writing the new target onto it,
+// and `#run` reads the target off the card, so switching the language
+// re-translated the same old language and looked like nothing happened.
+// ---------------------------------------------------------------------------
+
+/** Let the async translation runs finish. */
+async function settle() {
+  for (let attempt = 0; attempt < 20; attempt += 1) await new Promise((resolve) => setImmediate(resolve))
+}
+
+/** A translator spy that records the spec of every request it receives. */
+function specTranslator() {
+  const seen = []
+  return {
+    seen,
+    translator: {
+      chunks: (text) => [text],
+      translate: async (request) => {
+        seen.push({ text: request.text, lang: request.lang, mode: request.mode, sourceLang: request.sourceLang })
+        // A real translator streams its answer; the store builds the visible text
+        // (and the cache entry) out of the deltas, so a spy that only returns the
+        // value would fake a silently empty run.
+        const answer = `[${request.lang}/${request.mode}]`
+        request.onDelta?.(answer)
+        return answer
+      },
+    },
+  }
+}
+
+test('retry writes the new spec onto the card BEFORE the request is made', async () => {
+  const { RefsStore } = await import('../src/client/stores.js')
+  installFakeDom()
+  const store = new RefsStore('session-spec')
+  const { translator, seen } = specTranslator()
+  const key = store.add(
+    { text: 'Let me check the repository layout first.', kind: 'selection', lang: 'zh-CN', mode: 'general', sourceLang: 'auto' },
+    translator,
+  )
+  await settle()
+  assert.deepEqual(seen[0], {
+    text: 'Let me check the repository layout first.',
+    lang: 'zh-CN',
+    mode: 'general',
+    sourceLang: 'auto',
+  })
+
+  store.retry(key, translator, { lang: 'ja', mode: 'academic', sourceLang: 'en' })
+  await settle()
+  assert.deepEqual(seen[1], {
+    text: 'Let me check the repository layout first.',
+    lang: 'ja',
+    mode: 'academic',
+    sourceLang: 'en',
+  })
+  const ref = store.find(key)
+  assert.equal(ref.lang, 'ja', 'and the card now carries the new target')
+  assert.equal(ref.mode, 'academic')
+  assert.equal(ref.sourceLang, 'en')
+})
+
+test('re-adding the same text under a new gear re-runs it instead of showing the old answer', async () => {
+  const { RefsStore } = await import('../src/client/stores.js')
+  installFakeDom()
+  const store = new RefsStore('session-regear')
+  const { translator, seen } = specTranslator()
+  const text = 'Let me check the repository layout first.'
+  const key = store.add({ text, kind: 'selection', lang: 'zh-CN', mode: 'general', sourceLang: 'auto' }, translator)
+  await settle()
+  const cards = () => store.list().length
+
+  // Same text, same spec: the finished answer is reused (that is the whole point
+  // of the in-page cache) and no second request is made.
+  store.add({ text, kind: 'selection', lang: 'zh-CN', mode: 'general', sourceLang: 'auto' }, translator)
+  await settle()
+  assert.equal(seen.length, 1, 'a cache hit must not cost another call')
+  assert.equal(cards(), 1, 'and must not duplicate the card')
+  assert.equal(store.find(key).cached, true, 'the card says it came from the cache')
+
+  // Same text, NEW gear: one card (no duplicate), re-run under the new gear.
+  const again = store.add({ text, kind: 'selection', lang: 'zh-CN', mode: 'academic', sourceLang: 'auto' }, translator)
+  await settle()
+  assert.equal(again, key, 'the card keeps its identity across a gear change')
+  assert.equal(cards(), 1, 'a gear change must not leave two cards for one text')
+  assert.equal(seen.length, 2, 'the academic gear is a different answer, so it is a different request')
+  assert.equal(seen[1].mode, 'academic')
+  assert.equal(store.find(key).mode, 'academic')
+  assert.equal(store.find(key).translation, '[zh-CN/academic]')
+})
+
+test('the in-page cache is keyed by the gear, so a removed card still costs nothing to redo', async () => {
+  const { RefsStore } = await import('../src/client/stores.js')
+  installFakeDom()
+  const store = new RefsStore('session-cache')
+  const { translator, seen } = specTranslator()
+  const text = 'Let me check the repository layout first.'
+
+  const key = store.add({ text, kind: 'selection', lang: 'zh-CN', mode: 'general', sourceLang: 'auto' }, translator)
+  await settle()
+  // A gear switch and a switch back are the A/B comparison this cache exists for.
+  store.retry(key, translator, { lang: 'zh-CN', mode: 'academic', sourceLang: 'auto' })
+  await settle()
+  store.retry(key, translator, { lang: 'zh-CN', mode: 'general', sourceLang: 'auto' })
+  await settle()
+  assert.equal(seen.length, 3, 'an explicit retry always asks the model')
+
+  // Delete the card (it forgets ITS key only) and add the text again in the
+  // academic gear: the answer for THAT gear is still cached, and the general one
+  // must not be served in its place.
+  store.remove(key)
+  const again = store.add({ text, kind: 'selection', lang: 'zh-CN', mode: 'academic', sourceLang: 'auto' }, translator)
+  await settle()
+  assert.equal(seen.length, 3, 'the same gear is served from the page cache, not from the model')
+  const ref = store.find(again)
+  assert.equal(ref.translation, '[zh-CN/academic]', 'and it is the answer for the gear that was asked for')
+  assert.equal(ref.cached, true)
+})
+
+test('a card stored before beta.2 keeps working: no mode, no source, no migration', async () => {
+  const { RefsStore } = await import('../src/client/stores.js')
+  installFakeDom()
+  // Exactly what the previous version wrote: `lang` and nothing else.
+  globalThis.localStorage.setItem(
+    'dsh-translator:refs:session-legacy',
+    JSON.stringify({
+      refs: [
+        {
+          key: 'legacy',
+          text: 'Let me check the repository layout first.',
+          kind: 'selection',
+          lang: 'zh-CN',
+          sourceLabel: '划选内容',
+          status: 'done',
+          translation: '我先看一下仓库结构。',
+          error: null,
+          cached: false,
+          routeLabel: '',
+          at: 0,
+        },
+      ],
+    }),
+  )
+  const store = new RefsStore('session-legacy')
+  assert.equal(store.list().length, 1, 'an old card is not dropped for lacking the new fields')
+  const ref = store.list()[0]
+  assert.equal(ref.mode, 'general', 'it reads back as the default gear')
+
+  // And a retry gives it the current spec, so the next answer is correct.
+  const { translator, seen } = specTranslator()
+  store.retry(ref.key, translator, { lang: 'ja', mode: 'literary', sourceLang: 'en' })
+  await settle()
+  assert.deepEqual(seen[0], {
+    text: 'Let me check the repository layout first.',
+    lang: 'ja',
+    mode: 'literary',
+    sourceLang: 'en',
+  })
+})
+
+test('settings stored by the previous version gain the new fields without losing the old ones', async () => {
+  const { SettingsStore, DEFAULT_SETTINGS } = await import('../src/client/stores.js')
+  installFakeDom()
+  globalThis.localStorage.setItem('dsh-translator:settings', JSON.stringify({ targetLanguage: 'ja', maskCode: false }))
+  const settings = new SettingsStore()
+  const snapshot = settings.getSnapshot()
+  assert.equal(snapshot.targetLanguage, 'ja', 'the user keeps the target they chose')
+  assert.equal(snapshot.maskCode, false, 'and their other switches')
+  assert.equal(snapshot.sourceLanguage, 'auto', 'the new source defaults to detection')
+  assert.equal(snapshot.mode, 'general', 'and the new gear to the default one')
+  assert.equal(snapshot.customInstruction, '')
+  assert.equal(Object.keys(DEFAULT_SETTINGS).length, Object.keys(snapshot).length + 0, 'no field is missing')
+  settings.update({ mode: 'academic' })
+  settings.update({ sourceLanguage: 'en' })
+  const stored = JSON.parse(globalThis.localStorage.getItem('dsh-translator:settings'))
+  assert.equal(stored.mode, 'academic')
+  assert.equal(stored.sourceLanguage, 'en')
+  assert.equal(stored.targetLanguage, 'ja', 'an update merges instead of replacing')
+})
+
+// ---------------------------------------------------------------------------
+// The retranslate policy, driven through the REAL runtime.
+//
+// The seat hosts close over the plugin's own `runtime`, so reaching it through the
+// registered component exercises the wiring the user actually gets: a gear change
+// re-runs the cards, a pair change re-runs the ones that mean something, and the
+// swap case (an English card asked to become English) costs nothing and leaves the
+// card's own pair alone.
+// ---------------------------------------------------------------------------
+
+test('a gear change re-runs the cards, and a pair change never re-runs a card into its own language', async () => {
+  installFakeDom()
+  const registration = await loadClientBundle()
+  const createElement = makeReactStub()
+  const { ctx, calls } = makeContext()
+  const exports = registration.factory((specifier) => {
+    if (specifier === 'react') return makeReactModule(createElement)
+    if (specifier === 'react-dom') return { createPortal: (node) => node }
+    if (specifier === 'react-dom/client') return { createRoot: () => ({ render() {}, unmount() {} }) }
+    throw new Error(`unexpected external require: ${specifier}`)
+  })
+  exports.apply(ctx)
+
+  const seat = calls.slots.find((entry) => entry.name === 'sidebar.right.pane.tab')
+  const tree = seat.component({ sessionId: 'session-retranslate' })
+  const host = findElement(tree, (node) => typeof node?.props?.runtime?.addManual === 'function')
+  assert.ok(host !== undefined, 'the seat must hand the pane the plugin runtime')
+  const runtime = host.props.runtime
+  const store = host.props.store
+  const refs = () => store.getSnapshot().refs
+  const requests = stubFetch(LIVE_SSE_BODY)
+  const bodies = () => requests.map((request) => JSON.parse(request.init.body))
+
+  runtime.addManual('The plugin keeps every finished translation in a small local cache.')
+  await settle()
+  assert.equal(bodies().length, 1, 'one card, one call')
+  assert.equal(bodies()[0].mode, 'general')
+  assert.equal(bodies()[0].source, 'en', 'the source is detected and sent as a hint')
+
+  // A gear change is a different answer, so every card is re-run under it.
+  runtime.setMode('academic')
+  await settle()
+  assert.deepEqual(
+    bodies().map((body) => body.mode),
+    ['general', 'academic'],
+  )
+  assert.equal(refs()[0].mode, 'academic', 'and the card now carries the new gear')
+  assert.equal(refs().length, 1, 'a gear change never duplicates a card')
+
+  // The card is English and the target becomes English: there is nothing to do,
+  // and paying a model call to get the sentence back is exactly the waste the
+  // swap button would otherwise cause on every card in the list.
+  runtime.setTargetLanguage('en')
+  await settle()
+  assert.equal(bodies().length, 2, 'an English card is not re-run into English')
+  assert.equal(refs()[0].lang, 'zh-CN', 'and it keeps the pair it was translated under')
+  assert.equal(refs()[0].translation, '让我先检查一下仓库布局。', 'with its answer intact')
+
+  // A target that means something does re-run it.
+  runtime.setTargetLanguage('ja')
+  await settle()
+  assert.equal(bodies().length, 3, 'a real target change re-runs the card')
+  assert.equal(bodies()[2].lang, 'ja')
+  assert.equal(refs()[0].lang, 'ja')
+})
+
+// ---------------------------------------------------------------------------
 // The transport itself, against a real streamed body.
 //
 // This is the regression that matters most: the retry loop's index used to be
@@ -1324,16 +1773,7 @@ test('a broken store degrades the pane instead of abdicating the seat', async ()
   assert.equal(typeof pane, 'function')
   assert.equal(typeof failureLog, 'function', 'the failure log must be exportable for the self-report')
 
-  const runtime = {
-    addRef: () => {},
-    retry: () => {},
-    cancel: () => {},
-    remove: () => {},
-    clear: () => {},
-    setLanguage: () => {},
-    language: 'zh-CN',
-    shortcut: 'Ctrl+Shift+T',
-  }
+  const { runtime } = paneRuntime()
 
   // A store whose reads throw: the pane must still paint (React would otherwise
   // abdicate the whole seat and leave the column blank).

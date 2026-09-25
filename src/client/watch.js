@@ -10,7 +10,7 @@
  * @module dsh-translator/client/watch
  */
 
-import { classifySelection } from '../shared/select.js'
+import { classifySelection, languageLabel, languageShortLabel, targetCodeOf } from '../shared/select.js'
 
 /** Selectors whose subtree is off-limits (composer, panels, our own UI). */
 const BLOCKED_SELECTOR = [
@@ -121,10 +121,11 @@ function rectOf(selection) {
 /**
  * Read the current document selection as a trigger candidate.
  * @param pointer - the mouseup/mousedown pointer position, used to place the button.
- * @returns `{action, text, reason, rect, inCodeBlock, sourceLabel}` or null when
- *   there is no usable selection.
+ * @param policy - `{source, target}`: the language pair the verdict is made under.
+ * @returns `{action, text, reason, targetLabel, shortLabel, rect, inCodeBlock, sourceLabel}`
+ *   or null when there is no usable selection.
  */
-export function readSelection(pointer) {
+export function readSelection(pointer, policy = {}) {
   const selection = globalThis.getSelection?.()
   if (selection === null || selection === undefined) return null
   if (selection.isCollapsed === true || selection.rangeCount === 0) return null
@@ -138,9 +139,10 @@ export function readSelection(pointer) {
   if (isBlockedNode(anchor) || isBlockedNode(focus)) return null
   if (!insideChatSurface(anchor) && !insideChatSurface(focus)) return null
 
-  const classified = classifySelection(text)
+  const classified = classifySelection(text, policy)
   if (classified.action === 'ignore') return null
 
+  const target = targetCodeOf(policy)
   const rect = rectOf(selection)
   const viewport = viewportRect()
   const pointerLeft = Math.min(Math.max(pointer?.left ?? rect.right, 0), viewport.width)
@@ -148,6 +150,10 @@ export function readSelection(pointer) {
   return {
     action: classified.action,
     reason: classified.reason,
+    // The pill's copy is about the TARGET language, so it has to be told which
+    // one that is: "already Chinese" is wrong copy the moment the target moves.
+    targetLabel: languageLabel(target),
+    shortLabel: languageShortLabel(target),
     text: classified.text.slice(0, MAX_SELECTION_CHARS),
     truncated: classified.text.length > MAX_SELECTION_CHARS,
     rect: { ...rect, pointerLeft, pointerTop },
@@ -183,9 +189,11 @@ export function handleMouseDown(event, current, now) {
 /**
  * Install the document-level selection listener.
  * @param handler - called with the candidate (or null when nothing is selected).
+ * @param policyOf - returns the current `{source, target}` pair; read at the
+ *   moment of the selection, so changing the pair takes effect immediately.
  * @returns teardown function.
  */
-export function watchSelection(handler) {
+export function watchSelection(handler, policyOf = () => ({})) {
   let pointers = null
 
   const onDismiss = () => handler(null)
@@ -207,7 +215,13 @@ export function watchSelection(handler) {
     if (isOwnUiNode(event?.target)) return
     // Read the selection in the same window the browser keeps it: it survives
     // until the click, and the button below lives long enough to be clicked.
-    handler(readSelection({ left: event.clientX, top: event.clientY }))
+    let policy = {}
+    try {
+      policy = policyOf() ?? {}
+    } catch {
+      /* a broken settings read must not cost the user their selection */
+    }
+    handler(readSelection({ left: event.clientX, top: event.clientY }, policy))
   }
 
   document.addEventListener('mousedown', onPointerDown, true)

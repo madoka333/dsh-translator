@@ -116,10 +116,14 @@ export function SelectionTrigger({ candidate, onCommit, onDismiss }) {
   if (anchor === null) return null
 
   const disabled = anchor.meta.action === 'noop'
+  // The pill names the TARGET language, so the copy has to come from the
+  // candidate (which was classified under the live pair) rather than from a
+  // hard-coded "Chinese": with the target on Japanese, "已是中文" is a lie.
+  const shortLabel = anchor.meta.shortLabel ?? '目标语言'
 
   const commit = () => {
-    // An already-Chinese selection is a no-op: the pill explains itself and closes
-    // rather than spending a model call on text nothing would change.
+    // An already-target-language selection is a no-op: the pill explains itself
+    // and closes rather than spending a model call on text nothing would change.
     if (disabled) {
       onDismiss()
       return
@@ -129,7 +133,7 @@ export function SelectionTrigger({ candidate, onCommit, onDismiss }) {
   }
 
   const title = disabled
-    ? '这段内容看起来已经是中文，不需要翻译'
+    ? `这段内容看起来已经是${shortLabel}，不需要翻译`
     : `翻译这段内容：${anchor.text.slice(0, 60)}${anchor.text.length > 60 ? '…' : ''}`
 
   return createPortal(
@@ -170,8 +174,8 @@ export function SelectionTrigger({ candidate, onCommit, onDismiss }) {
         }
       }}
     >
-      <b>{disabled ? '中' : '译'}</b>
-      <span>{disabled ? '已是中文' : '翻译这段'}</span>
+      <b>译</b>
+      <span>{disabled ? `已是${shortLabel}` : '翻译这段'}</span>
     </div>,
     document.body,
   )

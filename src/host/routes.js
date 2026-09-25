@@ -15,10 +15,14 @@
  */
 
 import {
+  DEFAULT_MODE_ID,
+  MAX_INSTRUCTION_CHARS,
   MAX_UNIT_CHARS,
   framingInput,
+  isKnownMode,
   languageLabel,
   normalizeSelection,
+  normalizeSourceCode,
   translationSystemPrompt,
 } from '../shared/select.js'
 import { translationKey } from '../shared/cache.js'
@@ -113,13 +117,31 @@ async function handleTranslate(req, res, deps) {
 
   const kind = payload?.kind === 'reasoning' || payload?.kind === 'text' ? payload.kind : 'selection'
   const target = languageLabel(payload?.lang ?? deps.config().targetLanguage)
-  const cached = deps.cache.get(translationKey(text, target, route))
+  // The gear and the source hint are re-sanitized HERE, against this build's own
+  // tables: a page running a stale bundle, or a hand-written request, must not be
+  // able to put an arbitrary string where a prompt line goes. An unknown gear
+  // becomes the default one, and the source defaults to the deployment's setting
+  // (which is `auto` — i.e. the model decides — unless a profile pinned it).
+  const requested = String(payload?.mode ?? deps.config().mode)
+  const mode = isKnownMode(requested) ? requested : DEFAULT_MODE_ID
+  const source = normalizeSourceCode(payload?.source ?? deps.config().sourceLanguage)
+  // The custom gear's text is part of the ANSWER, not just of the prompt: editing
+  // it must invalidate a cached answer, or "I changed my requirement and nothing
+  // happened" becomes a bug report.
+  const instruction = instructionOf(payload?.instruction ?? deps.config().customInstruction)
+  const style = mode === 'custom' ? instruction : ''
+  const cached = deps.cache.get(translationKey(text, target, route, { mode, source, style }))
   if (cached !== undefined) {
     writeCachedSse(res, route, cached)
     return
   }
 
-  await streamTranslation({ req, res, deps, text, kind, target, route })
+  await streamTranslation({ req, res, deps, text, kind, target, mode, source, instruction, route })
+}
+
+/** Truncate one custom instruction to the length the prompt may carry. */
+function instructionOf(value) {
+  return String(value ?? '').trim().slice(0, MAX_INSTRUCTION_CHARS)
 }
 
 /**
@@ -127,7 +149,7 @@ async function handleTranslate(req, res, deps) {
  * deltas. Aborts the model call when the browser disconnects, so a cancelled
  * card stops costing tokens.
  */
-async function streamTranslation({ req, res, deps, text, kind, target, route }) {
+async function streamTranslation({ req, res, deps, text, kind, target, mode, source, instruction, route }) {
   const controller = new AbortController()
   const timeoutMs = deps.config().timeoutMs ?? DEFAULT_TIMEOUT_MS
   const timer = setTimeout(() => controller.abort(new Error('dsh-translator: timeout')), timeoutMs)
@@ -151,7 +173,7 @@ async function streamTranslation({ req, res, deps, text, kind, target, route }) 
     const stream = deps.stream({
       provider: route.provider,
       model: route.model,
-      system: translationSystemPrompt(target, kind),
+      system: translationSystemPrompt(target, kind, { source, mode, customInstruction: instruction }),
       input: framingInput(text, kind),
       maxTokens: deps.config().maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
       signal: controller.signal,
@@ -173,7 +195,7 @@ async function streamTranslation({ req, res, deps, text, kind, target, route }) 
       res.end()
       return
     }
-    deps.cache.set(translationKey(text, target, route), collected)
+    deps.cache.set(translationKey(text, target, route, { mode, source, style: mode === 'custom' ? instruction : '' }), collected)
     sse(res, { type: 'done', chars: [...collected].length })
     res.end()
   } catch (error) {

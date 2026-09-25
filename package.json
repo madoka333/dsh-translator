@@ -1,6 +1,6 @@
 {
   "name": "dsh-translator",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "private": true,
   "description": "DSH Web GUI 划选翻译：鼠标划选对话里的英文（Think 推理、中间步骤正文、任意片段）→ 引用到右侧边栏「翻译」页签 → 官方 LLM 流式出中文译文。纯显示层，译文不写入会话日志、不占上下文。",
   "type": "module",

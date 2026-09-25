@@ -18,6 +18,7 @@
  */
 
 import { LruCache } from '../shared/cache.js'
+import { DEFAULT_MODE_ID, MAX_INSTRUCTION_CHARS, SOURCE_AUTO, isKnownMode, normalizeSourceCode } from '../shared/select.js'
 import { createTranslateRoute, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_TIMEOUT_MS } from './routes.js'
 
 /** Plugin name — matches the package name, the bundle id, and the client entry id. */
@@ -45,6 +46,9 @@ const CONFIG_DEFAULTS = {
   provider: undefined,
   model: undefined,
   targetLanguage: 'zh-CN',
+  sourceLanguage: SOURCE_AUTO,
+  mode: DEFAULT_MODE_ID,
+  customInstruction: '',
   timeoutMs: 30_000,
   maxOutputTokens: 4096,
   cacheSize: 500,
@@ -83,6 +87,33 @@ export function resolveConfig(value = {}) {
   }
   if (typeof out.targetLanguage !== 'string' || out.targetLanguage === '') {
     throw new Error('dsh-translator: config.targetLanguage must be a non-empty string')
+  }
+  // The pair is validated as a pair: a deployment that pins both sides to the
+  // same language would refuse every translation, which reads as "the plugin is
+  // broken" long after the config was written.
+  if (typeof out.sourceLanguage !== 'string') {
+    throw new Error('dsh-translator: config.sourceLanguage must be a language code or "auto"')
+  }
+  if (normalizeSourceCode(out.sourceLanguage) !== out.sourceLanguage) {
+    throw new Error(
+      `dsh-translator: config.sourceLanguage "${out.sourceLanguage}" is not a known language code or "auto"`,
+    )
+  }
+  if (out.sourceLanguage !== SOURCE_AUTO) {
+    // Compared as CODES: the target may legitimately be written as a label, and a
+    // target this build cannot resolve is left alone rather than guessed at.
+    const targetCode = normalizeSourceCode(out.targetLanguage)
+    if (targetCode !== SOURCE_AUTO && targetCode === out.sourceLanguage) {
+      throw new Error('dsh-translator: config.sourceLanguage and config.targetLanguage must differ')
+    }
+  }
+  if (!isKnownMode(out.mode)) {
+    throw new Error(`dsh-translator: config.mode "${out.mode}" is not a known translation mode`)
+  }
+  if (typeof out.customInstruction !== 'string' || out.customInstruction.length > MAX_INSTRUCTION_CHARS) {
+    throw new Error(
+      `dsh-translator: config.customInstruction must be a string of at most ${MAX_INSTRUCTION_CHARS} characters`,
+    )
   }
   assertIntInRange('timeoutMs', out.timeoutMs, 1000, 600_000)
   assertIntInRange('maxOutputTokens', out.maxOutputTokens, 64, 64_000)

@@ -81,3 +81,24 @@ test('translationKey separates provider, model, language and source', () => {
 test('translationKey tolerates a missing route', () => {
   assert.equal(typeof translationKey('x', '简体中文', undefined), 'string')
 })
+
+test('translationKey separates the gear, the source hint and the custom requirement', () => {
+  const route = { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
+  const base = translationKey('hello', '简体中文', route, { mode: 'general', source: 'en' })
+  assert.notEqual(base, translationKey('hello', '简体中文', route, { mode: 'academic', source: 'en' }), 'gear matters')
+  assert.notEqual(base, translationKey('hello', '简体中文', route, { mode: 'general', source: 'ja' }), 'source matters')
+  assert.notEqual(
+    base,
+    translationKey('hello', '简体中文', route, { mode: 'custom', source: 'en', style: 'keep it short' }),
+    'the custom requirement matters',
+  )
+  assert.notEqual(
+    translationKey('hello', '简体中文', route, { mode: 'custom', source: 'en', style: 'keep it short' }),
+    translationKey('hello', '简体中文', route, { mode: 'custom', source: 'en', style: 'keep it formal' }),
+    'editing the requirement must invalidate the answer',
+  )
+  assert.equal(base, translationKey('hello', '简体中文', route, { mode: 'general', source: 'en' }), 'same spec, same key')
+  // The pre-beta.2 three-argument call is a DIFFERENT key from a gear-aware one:
+  // that is fine (the host cache is in-process), and it must stay a string.
+  assert.equal(typeof translationKey('hello', '简体中文', route), 'string')
+})

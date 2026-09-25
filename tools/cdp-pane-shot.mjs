@@ -142,6 +142,16 @@ const facts = await run(`(() => {
 })()`);
 console.log('pane facts:', JSON.stringify(facts));
 
+// Park the pointer OUTSIDE the sidebar before capturing.
+//
+// ui-sidebar-right renders a hover bubble (`position:fixed`, z-index 100) while the
+// pointer rests on its tab strip, and that bubble lands on the right end of this
+// pane's toolbar — a screenshot taken straight after a click therefore shows
+// "收起侧边栏 Ctrl+Shift+B" painted over the count and 清空, which reads as a layout
+// bug in the pane. It is not: the bubble disappears as soon as the pointer leaves.
+await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 420, y: 400, buttons: 0, clickCount: 0 });
+await sleep(500);
+
 const s = await send('Page.captureScreenshot', { format: 'png' });
 writeFileSync(join(OUT, NAME), Buffer.from(s.data, 'base64'));
 console.log('shot ->', NAME);
