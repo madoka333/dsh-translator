@@ -207,6 +207,30 @@ for (let i = 0; i < 40; i++) {
 note('05-after-enter', done);
 await shot('h2-committed.png');
 
+// ---- 5b) fill the list, so the card/list design can be reviewed under load ----
+const MORE = ['Reasoning about the tradeoffs takes longer than the edit itself.', 'Latency matters more than throughput for an interactive panel.'];
+for (const text of MORE) {
+  await typeInto(text);
+  await pressEnter();
+}
+let listState = null;
+for (let i = 0; i < 60; i++) {
+  await sleep(1000);
+  listState = await run(`(() => {
+    const pane = document.querySelector('.dsht-pane');
+    const cards = pane ? Array.from(pane.querySelectorAll('.dsht-card')) : [];
+    return {
+      cards: cards.length,
+      done: cards.filter((c) => c.querySelector('.dsht-badge')?.getAttribute('data-state') === 'done').length,
+      listScrolls: (() => { const l = document.querySelector('.dsht-list'); return l ? l.scrollHeight > l.clientHeight : null; })(),
+      composerBottom: (() => { const b = document.querySelector('.dsht-composer'); const p = pane; if (!b || !p) return null; return Math.round(p.getBoundingClientRect().bottom - b.getBoundingClientRect().bottom); })(),
+    };
+  })()`);
+  if (listState && listState.cards === 3 && listState.done === 3) break;
+}
+note('05b-list', listState);
+await shot('h3-list.png');
+
 // ---- 5) the draft store must be clean for the committed text ---------------
 const storage = await run(`(() => {
   const out = {};
@@ -235,6 +259,11 @@ if (done?.status !== 'done') failures.push(`the card never finished (status=${do
 if (done?.label !== '手动输入') failures.push(`expected the 手动输入 label, got ${JSON.stringify(done?.label)}`);
 if (!/[\u4e00-\u9fff]/.test(done?.out ?? '')) failures.push(`no Chinese translation in the card: ${JSON.stringify(done?.out)}`);
 if (done?.value !== '') failures.push(`the box was not cleared after commit (got ${JSON.stringify(done?.value)})`);
+if (listState?.cards !== 3) failures.push(`expected three cards after two more commits, got ${listState?.cards}`);
+if (listState?.done !== 3) failures.push(`expected three finished cards, got ${listState?.done}`);
+if (!(listState?.composerBottom >= 0 && listState.composerBottom < 24)) {
+  failures.push(`the composer drifted off the pane bottom by ${listState?.composerBottom}px`);
+}
 if (Object.keys(storage ?? {}).length !== 0) failures.push(`a draft key survived the commit: ${JSON.stringify(storage)}`);
 
 console.log('--- exceptions ---');

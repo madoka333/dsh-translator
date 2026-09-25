@@ -902,6 +902,41 @@ test('a draft is per Session, and dropping text stages it instead of translating
   assert.deepEqual(calls.manual, [], 'nor committed')
 })
 
+// ---------------------------------------------------------------------------
+// Stylesheet integrity.
+//
+// The whole sheet is ONE template literal in `src/client/styles.js`, so a backtick
+// in a comment inside it terminates the literal early. With an ODD count the bundle
+// stops parsing → the client entry fails to import → dsh's web boot throws and the
+// whole GUI dies. With an EVEN count it still parses, but the sheet is assembled out
+// of mismatched literal pieces and real rules silently disappear. Both cases reach
+// production looking like "the plugin is ugly/broken", so the shipped sheet is
+// asserted here and the bundle's compilability is asserted in tools/verify-build.mjs.
+// ---------------------------------------------------------------------------
+
+test('the installed stylesheet arrives intact, not truncated by a stray backtick', async () => {
+  await mount()
+  const tag = globalThis.document.getElementById('dsh-translator-style')
+  assert.ok(tag !== null && tag !== undefined, 'apply must install the stylesheet')
+  const css = tag.textContent
+  assert.ok(css.includes(`.${CLS}-trigger{`), 'the FIRST rule must survive')
+  assert.ok(css.includes('@media (prefers-reduced-motion:reduce)'), 'the LAST rule must survive')
+  assert.ok(css.includes(`.${CLS}-composer{`), 'and the composer rule must be there')
+  // A stray `}` on the dragover selector was a real defect: the browser skips a
+  // malformed rule, so the drag hint silently lost its highlight while the sheet
+  // still looked fine. Balance alone would pass with a rule dropped and another
+  // duplicated, so the rule that broke is named here.
+  assert.ok(
+    css.includes(`.${CLS}-pane[data-dragover=true] .${CLS}-drop{`),
+    'the dragover rule must be well formed, not skipped as malformed',
+  )
+  assert.equal(css.includes('${'), false, 'no un-interpolated template hole may reach the document')
+  assert.equal(css.includes('undefined'), false, 'and no undefined may leak into a declaration')
+  const open = (css.match(/\{/g) ?? []).length
+  const close = (css.match(/\}/g) ?? []).length
+  assert.equal(open, close, `the sheet must have balanced braces (got ${open} "{" and ${close} "}")`)
+})
+
 test('the mounted tree is renderable and carries no undefined props', async () => {
   const mounted = await mount()
   const tree = mounted.rootRender

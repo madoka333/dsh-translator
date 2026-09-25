@@ -165,6 +165,21 @@ function statusLabel(ref) {  switch (ref.status) {
 }
 
 /**
+ * `provider/model` → `model`, for the meta row.
+ *
+ * The full route is the longest string on the card and it is the same value on every
+ * card, so it was dominating a row the eye should be scanning for the STATUS. The
+ * provider stays available in the tooltip.
+ * @param route - the route label as the host reports it.
+ * @returns the model part, or the whole label when there is no slash.
+ */
+function modelLabel(route) {
+  const value = String(route ?? '')
+  const slash = value.lastIndexOf('/')
+  return slash === -1 ? value : value.slice(slash + 1)
+}
+
+/**
  * One reference card.
  *
  * The reference arrives as `item`, NOT as `ref`: `ref` is a React-reserved prop
@@ -172,6 +187,10 @@ function statusLabel(ref) {  switch (ref.status) {
  * element ref, strip it from props, and hand the component `undefined`. That
  * crashed the pane's seat the moment a card had to render — the sidebar showed
  * the slot's error cell instead of any card.
+ *
+ * The meta row opens with the source label and then a spacer that pushes the badges
+ * to the right edge. That order is load-bearing: the browser probe reads the FIRST
+ * `span` inside `.dsht-meta` as the card's label, so the spacer must come after it.
  */
 function RefCard({ item, onRetry, onRemove, onCancel, onCopy }) {
   const ref = item
@@ -180,11 +199,14 @@ function RefCard({ item, onRetry, onRemove, onCancel, onCopy }) {
     <div className={`${CLS}-card`} data-dsh-translator-ui="1" data-active={String(expanded)}>
       <div className={`${CLS}-meta`}>
         {ref.sourceLabel !== '' && <span>{ref.sourceLabel}</span>}
+        <span className={`${CLS}-spacer`} />
         {ref.kind === 'reasoning' && <span className={`${CLS}-badge`}>Think</span>}
         <span className={`${CLS}-badge`} data-state={ref.status}>
           {statusLabel(ref)}
         </span>
-        {ref.routeLabel !== '' && <span title="本次翻译所用模型">{ref.routeLabel}</span>}
+        {ref.routeLabel !== '' && (
+          <span title={'本次翻译所用模型：' + ref.routeLabel}>{modelLabel(ref.routeLabel)}</span>
+        )}
         <span>{[...ref.text].length} 字</span>
       </div>
       <div
@@ -309,6 +331,15 @@ function Composer({ runtime, sessionKey, onNotice }) {
 
   return (
     <div className={`${CLS}-composer`} data-dsh-translator-ui="1">
+      <button
+        type="button"
+        className={`${CLS}-send`}
+        disabled={text.trim() === ''}
+        title="翻译输入框里的内容"
+        onClick={commit}
+      >
+        翻译
+      </button>
       <textarea
         className={`${CLS}-input`}
         value={text}
@@ -323,9 +354,6 @@ function Composer({ runtime, sessionKey, onNotice }) {
         onCompositionStart={() => setComposing(true)}
         onCompositionEnd={() => setComposing(false)}
       />
-      <button type="button" disabled={text.trim() === ''} title="翻译输入框里的内容" onClick={commit}>
-        翻译
-      </button>
     </div>
   )
 }
@@ -448,17 +476,19 @@ function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, hand
       onDrop={onDrop}
     >
       <div className={`${CLS}-bar`}>
-        <select
-          value={runtime.language}
-          title="目标语言"
-          onChange={(event) => runtime.setLanguage(event.target.value)}
-        >
-          {LANGUAGE_CHOICES.map((choice) => (
-            <option key={choice.code} value={choice.code}>
-              {choice.label}
-            </option>
-          ))}
-        </select>
+        <span className={`${CLS}-select`}>
+          <select
+            value={runtime.language}
+            title="目标语言"
+            onChange={(event) => runtime.setLanguage(event.target.value)}
+          >
+            {LANGUAGE_CHOICES.map((choice) => (
+              <option key={choice.code} value={choice.code}>
+                {choice.label}
+              </option>
+            ))}
+          </select>
+        </span>
         <span className={`${CLS}-spacer`} />
         <span className={`${CLS}-beta`} title="dsh-translator beta 分支：底部输入框">
           beta
@@ -471,11 +501,14 @@ function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, hand
 
       {refs.length === 0 ? (
         <div className={`${CLS}-empty`}>
-          <div>还没有引用。</div>
-          <div>
-            在对话里<b>划选</b>英文内容 → 点 <b>译</b> 按钮
+          <div className={`${CLS}-empty-glyph`} aria-hidden="true">
+            译
           </div>
-          <div>或者把「译」按钮拖到这里</div>
+          <div className={`${CLS}-empty-lead`}>还没有引用。</div>
+          <div>
+            在对话里<b>划选</b>英文 → 点 <b>译</b>
+          </div>
+          <div>或在下面的输入框里打字、粘贴</div>
           <div>
             快捷键 <kbd>{runtime.shortcut}</kbd>
           </div>

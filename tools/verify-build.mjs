@@ -25,6 +25,20 @@ assert.equal(
 const leftoverJsx = clientSource.match(/<[A-Za-z][\w.]*[\s>]/g) ?? []
 assert.equal(leftoverJsx.length, 0, `bundle still contains JSX: ${leftoverJsx.slice(0, 3).join(', ')}`)
 
+// The bundle must COMPILE, not merely exist. dsh's web boot treats an entry whose
+// module fails to import as "did not activate" and throws, so an unparseable client
+// bundle does not degrade this plugin — it leaves the whole Web GUI on the boot
+// screen. That is not hypothetical: a backtick inside the CSS template literal's
+// comment terminated the literal early, the bundle stopped parsing, and the app died
+// at boot. `new Function` compiles the source without running it, which is exactly
+// the check that was missing.
+try {
+  // eslint-disable-next-line no-new-func -- compiling IS the assertion
+  new Function(clientSource)
+} catch (error) {
+  assert.fail(`lib/client.js does not compile, so dsh web boot would fail: ${error.message}`)
+}
+
 let registration
 globalThis.window = {
   __ModuleLoader__: {
