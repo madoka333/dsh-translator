@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import test from 'node:test'
 
-import { PROBE_MARKER, apply, resolveRoute, translateStream } from '../src/host/index.js'
+import { PROBE_MARKER, apply, resolveConfig, resolveConfigOrWarn, resolveRoute, translateStream } from '../src/host/index.js'
 
 /** A fake `IncomingMessage`. */
 class FakeRequest extends EventEmitter {
@@ -36,6 +36,36 @@ class FakeResponse {
   headers = {}
   chunks = []
   writableEnded = false
+  listeners = {}
+
+  /**
+   * The route attaches an `error` listener to the response (a socket error must not
+   * become an unhandled 'error' event on the host's own http server), so the fake
+   * has to be event-shaped.
+   * @param event - event name.
+   * @param listener - callback.
+   * @returns this.
+   */
+  on(event, listener) {
+    this.listeners[event] = [...(this.listeners[event] ?? []), listener]
+    return this
+  }
+
+  /** @param event - event name. @param listener - callback. @returns this. */
+  off(event, listener) {
+    this.listeners[event] = (this.listeners[event] ?? []).filter((entry) => entry !== listener)
+    return this
+  }
+
+  /** @param event - event name. @param listener - callback. @returns this. */
+  once(event, listener) {
+    return this.on(event, listener)
+  }
+
+  /** @param event - event name. @param args - payload. */
+  emit(event, ...args) {
+    for (const listener of this.listeners[event] ?? []) listener(...args)
+  }
 
   /** @param status - HTTP status. @param headers - response headers. */
   writeHead(status, headers) {
@@ -92,8 +122,16 @@ async function call(handler, request) {
   return response
 }
 
-/** Build a fake host context with one recording LLM adapter. */
-function makeHost({ models = [{ id: 'deepseek-v4-flash' }], chunks = null, fail = null } = {}) {
+/**
+ * Build a fake host context with one recording LLM adapter.
+ *
+ * `listModels` is ASYNC and the catalog mirrors the shipped DeepSeek adapter
+ * (`deepseek-flash`, `deepseek-v4-pro`). Both matter: a synchronous mock encodes a
+ * contract 0.1.7-rc.2 does not have (the plugin then silently skipped every catalog
+ * check), and a catalog that advertises a model the real adapter does not have
+ * would hide the fallback-route bug.
+ */
+function makeHost({ models = [{ id: 'deepseek-flash' }, { id: 'deepseek-v4-pro' }], chunks = null, fail = null } = {}) {
   const registered = []
   const sections = []
   const taps = []
@@ -130,7 +168,9 @@ function makeHost({ models = [{ id: 'deepseek-v4-flash' }], chunks = null, fail 
     if (name === 'agentDefaultModel') return { currentSelection: () => selection }
     if (name !== 'llm') return undefined
     return {
-      listModels: (provider) => (provider === 'deepseek-official' ? models : []),
+      async listModels(provider) {
+        return provider === 'deepseek-official' ? models : []
+      },
       listProviders: () => [{ id: 'deepseek-official' }],
       stream(options) {
         calls.push(options)
@@ -220,10 +260,22 @@ test('the probe script is syntactically valid JavaScript', () => {
   assert.doesNotThrow(() => new Function(code), 'the probe must parse')
 })
 
-test('apply rejects a half-configured route and unknown keys', () => {
-  const { ctx } = makeHost()
-  assert.throws(() => apply(ctx, { provider: 'x' }), /must be supplied together/)
-  assert.throws(() => apply(ctx, { nope: 1 }), /unknown config key/)
+test('a bad deployment config degrades to the defaults instead of failing the boot', () => {
+  const { ctx, registered, sections } = makeHost()
+  const warnings = []
+  // `resolveConfig` still validates loudly (it is exported and directly assertable)…
+  assert.throws(() => resolveConfig({ provider: 'x' }), /must be supplied together/)
+  assert.throws(() => resolveConfig({ nope: 1 }), /unknown config key/)
+  // …but `apply` must NOT throw: an `apply` throw fails the whole plugin tree in
+  // 0.1.7-rc.2 (`dsh-app-boot`), which blanks the entire Web GUI at the boot screen.
+  // Losing a config value is recoverable; losing the GUI is not.
+  assert.doesNotThrow(() => resolveConfigOrWarn({ provider: 'x' }, (line) => warnings.push(line)))
+  assert.equal(warnings.length, 1)
+  assert.ok(warnings[0].includes('must be supplied together'), warnings[0])
+  assert.doesNotThrow(() => apply(ctx, { provider: 'x' }))
+  assert.doesNotThrow(() => apply(ctx, { nope: 1 }))
+  assert.equal(registered.length, 2, 'the plugin still mounted itself')
+  assert.equal(sections.length, 2)
 })
 
 test('health reports the resolved route', async () => {
@@ -235,9 +287,9 @@ test('health reports the resolved route', async () => {
   const body = JSON.parse(response.body)
   assert.equal(body.ok, true)
   assert.equal(body.llm, true)
-  // The fake adapter serves only `deepseek-v4-flash`, so the session selection
-  // (`deepseek-flash`) is not routable and the cheapest served model wins.
-  assert.deepEqual(body.route, { provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+  // The fake catalog is the shipped one, so the session selection IS routable and
+  // wins over the fallback.
+  assert.deepEqual(body.route, { provider: 'deepseek-official', model: 'deepseek-flash' })
 })
 
 test('a non-loopback Host is refused before anything else happens', async () => {
@@ -283,7 +335,7 @@ test('translate streams start → deltas → done, in order, in the target langu
   assert.equal(response.headers['cache-control'], 'no-store')
   const frames = response.frames
   assert.equal(frames[0].type, 'start')
-  assert.deepEqual(frames[0].route, { provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+  assert.deepEqual(frames[0].route, { provider: 'deepseek-official', model: 'deepseek-flash' })
   const deltas = frames.filter((frame) => frame.type === 'delta')
   assert.equal(deltas.map((frame) => frame.text).join(''), '我先看仓库结构。')
   assert.equal(frames.at(-1).type, 'done')
@@ -291,7 +343,7 @@ test('translate streams start → deltas → done, in order, in the target langu
   // The request the provider actually received.
   assert.equal(calls.length, 1)
   assert.equal(calls[0].provider, 'deepseek-official')
-  assert.equal(calls[0].model, 'deepseek-v4-flash')
+  assert.equal(calls[0].model, 'deepseek-flash')
   assert.equal(calls[0].messages.length, 1)
   assert.equal(calls[0].messages[0].role, 'user')
   assert.equal(calls[0].messages[0].source.plugin, 'dsh-translator')
@@ -397,14 +449,19 @@ test('the custom gear carries its requirement, and editing it invalidates the an
 test('config: the pair and the gear are validated as a pair', () => {
   const { ctx } = makeHost()
   apply(ctx, { sourceLanguage: 'en', mode: 'literary' })
-  assert.throws(() => apply(ctx, { mode: 'nonsense' }), /not a known translation mode/)
-  assert.throws(() => apply(ctx, { sourceLanguage: 'nonsense' }), /is not a known language code/)
-  assert.throws(() => apply(ctx, { sourceLanguage: 'en', targetLanguage: 'en' }), /must differ/)
+  // Validation lives in `resolveConfig` (and is what a deployment author sees in the
+  // log), while `apply` degrades to the defaults rather than throwing — see the
+  // boot-safety test above.
+  assert.throws(() => resolveConfig({ mode: 'nonsense' }), /not a known translation mode/)
+  assert.throws(() => resolveConfig({ sourceLanguage: 'nonsense' }), /is not a known language code/)
+  assert.throws(() => resolveConfig({ sourceLanguage: 'en', targetLanguage: 'en' }), /must differ/)
   // A target written as a LABEL resolves to the same code, so it collides too.
-  assert.throws(() => apply(ctx, { sourceLanguage: 'en', targetLanguage: 'English' }), /must differ/)
-  assert.throws(() => apply(ctx, { customInstruction: 'x'.repeat(401) }), /at most 400 characters/)
+  assert.throws(() => resolveConfig({ sourceLanguage: 'en', targetLanguage: 'English' }), /must differ/)
+  assert.throws(() => resolveConfig({ customInstruction: 'x'.repeat(401) }), /at most 400 characters/)
+  assert.throws(() => resolveConfig({ reasoningEffort: '' }), /reasoningEffort must be a non-empty string/)
   // A target this build cannot resolve is left alone rather than guessed at.
-  assert.doesNotThrow(() => apply(ctx, { sourceLanguage: 'en', targetLanguage: 'Klingon' }))
+  assert.doesNotThrow(() => resolveConfig({ sourceLanguage: 'en', targetLanguage: 'Klingon' }))
+  assert.doesNotThrow(() => apply(ctx, { mode: 'nonsense' }), 'a bad config must not take the GUI down')
 })
 
 test('config: a deployment can pin the gear and the requirement for the whole house', async () => {
@@ -460,30 +517,33 @@ test('max-tokens truncation is surfaced as an error code', async () => {
   assert.equal(calls.length, 1)
 })
 
-test('resolveRoute skips a route the adapter does not serve', () => {
-  const { ctx } = makeHost({ models: [{ id: 'deepseek-v4-flash' }] })
-  // The session selection (deepseek-flash) is unavailable → fall back to the
-  // candidate that the registry proves is served.
-  const [route] = resolveRoute(ctx, { provider: undefined, model: undefined }, undefined)
-  assert.deepEqual(route, { provider: 'deepseek-official', model: 'deepseek-v4-flash' })
-})
-
-test('resolveRoute keeps a routable session selection', () => {
-  const { ctx } = makeHost({ models: [{ id: 'deepseek-v4-flash' }, { id: 'deepseek-flash' }] })
-  const [route] = resolveRoute(ctx, { provider: undefined, model: undefined }, undefined)
-  assert.deepEqual(route, { provider: 'deepseek-official', model: 'deepseek-flash' })
-})
-
-test('resolveRoute prefers an explicit per-request route', () => {
-  const { ctx } = makeHost({ models: [{ id: 'deepseek-v4-pro' }, { id: 'deepseek-v4-flash' }] })
-  const [route] = resolveRoute(ctx, { provider: undefined, model: undefined }, {
-    provider: 'deepseek-official',
-    model: 'deepseek-v4-pro',
-  })
+test('resolveRoute skips a route the adapter does not serve', async () => {
+  const { ctx } = makeHost({ models: [{ id: 'deepseek-v4-pro' }] })
+  // The session selection (`deepseek-flash`) and the hard-coded fallback are both
+  // absent from this catalog, so the resolver steps down to the first model the
+  // adapter actually advertises — this is the check that was dead while
+  // `listModels` was mistaken for a synchronous array.
+  const [route] = await resolveRoute(ctx, { provider: undefined, model: undefined }, undefined)
   assert.deepEqual(route, { provider: 'deepseek-official', model: 'deepseek-v4-pro' })
 })
 
-test('resolveRoute reports no route when the llm service is absent', () => {
+test('resolveRoute keeps a routable session selection', async () => {
+  const { ctx } = makeHost({ models: [{ id: 'deepseek-v4-pro' }, { id: 'deepseek-flash' }] })
+  const [route] = await resolveRoute(ctx, { provider: undefined, model: undefined }, undefined)
+  assert.deepEqual(route, { provider: 'deepseek-official', model: 'deepseek-flash' })
+})
+
+test('resolveRoute prefers an explicit per-request route', async () => {
+  const { ctx } = makeHost({ models: [{ id: 'deepseek-v4-pro' }, { id: 'deepseek-flash' }] })
+  const [route] = await resolveRoute(
+    ctx,
+    { provider: undefined, model: undefined },
+    { provider: 'deepseek-official', model: 'deepseek-v4-pro' },
+  )
+  assert.deepEqual(route, { provider: 'deepseek-official', model: 'deepseek-v4-pro' })
+})
+
+test('resolveRoute reports no route when the llm service is absent', async () => {
   const ctx = {
     effect: (factory) => {
       factory()
@@ -491,7 +551,25 @@ test('resolveRoute reports no route when the llm service is absent', () => {
     },
     get: () => undefined,
   }
-  assert.deepEqual(resolveRoute(ctx, { provider: undefined, model: undefined }, undefined), [])
+  assert.deepEqual(await resolveRoute(ctx, { provider: undefined, model: undefined }, undefined), [])
+})
+
+test('resolveRoute survives a registry that rejects instead of listing', async () => {
+  const ctx = {
+    get: (name) =>
+      name === 'llm'
+        ? {
+            listModels: async () => {
+              throw new Error('unknown provider')
+            },
+            listProviders: () => [{ id: 'deepseek-official' }],
+          }
+        : undefined,
+  }
+  // The rejection must not become an unhandled rejection in the host process: no
+  // catalog means "trust the provider", which is the documented degraded path.
+  const [route] = await resolveRoute(ctx, { provider: undefined, model: undefined }, undefined)
+  assert.deepEqual(route, { provider: 'deepseek-official', model: 'deepseek-flash' })
 })
 
 test('translateStream reports NO_LLM rather than throwing when the service is missing', async () => {

@@ -35,6 +35,12 @@ test('the tripwire is not vacuous: a name dsh really removed is reported MISSING
 test('runCheck passes against the installed dsh and reports every binding', async () => {
   const result = await runCheck(roots)
   assert.deepEqual(result.missing, [], `unexpected missing bindings: ${JSON.stringify(result.missing)}`)
-  assert.equal(result.rows.length, 10, 'seven services plus three slots')
+  const kinds = result.rows.reduce((counts, row) => ({ ...counts, [row.kind]: (counts[row.kind] ?? 0) + 1 }), {})
+  assert.equal(kinds.service, 7, 'the services this plugin reads')
+  assert.equal(kinds.slot, 3, 'the slots it seats into')
+  // The three `dsh.client.inject` packages are a CLIENT BUNDLE load-order
+  // dependency: dsh awaits each before this plugin's factory, and a missing one fails
+  // the consumer. They are checked by existence, and nothing else covered them.
+  assert.equal(kinds.bundle, 3, 'the client bundles it must load after')
   assert.ok(result.roots.length >= 1, 'at least one dsh install root must be present')
 })

@@ -1,8 +1,8 @@
 {
   "name": "dsh-translator",
-  "version": "0.2.0-beta.2",
+  "version": "0.2.0",
   "private": true,
-  "description": "DSH Web GUI 划选翻译：鼠标划选对话里的英文（Think 推理、中间步骤正文、任意片段）→ 引用到右侧边栏「翻译」页签 → 官方 LLM 流式出中文译文。纯显示层，译文不写入会话日志、不占上下文。",
+  "description": "DSH Web GUI 划选翻译：鼠标划选对话里的外文（Think 推理、中间步骤正文、任意片段）→ 引用到右侧边栏「翻译」页签 → 官方 LLM 流式出译文。源语言自动识别、语言对 x→y、8 个翻译挡位。纯显示层，译文不写入会话日志、不占上下文。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -20,8 +20,9 @@
   "scripts": {
     "build": "node build.mjs",
     "test": "node --test test/*.test.mjs",
-    "verify": "node build.mjs && node --test test/*.test.mjs && node tools/verify-build.mjs",
-    "compat": "node tools/check-dsh-compat.mjs"
+    "verify": "node build.mjs && node --test test/*.test.mjs && node tools/verify-build.mjs && node tools/host-prompt-probe.mjs",
+    "compat": "node tools/check-dsh-compat.mjs",
+    "probe": "node tools/host-prompt-probe.mjs"
   },
   "dsh": {
     "bundle": {

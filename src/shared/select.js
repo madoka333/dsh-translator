@@ -37,40 +37,16 @@ const MD_LINK_ONLY_RE = /^!?\[[^\]]*\]\([^)]*\)$/
 /** Leading token that reads as an executable or a command path. */
 const COMMAND_HEAD_RE = /^(?:[a-z0-9_.-]+\.(?:exe|cmd|bat|ps1|sh|py|js|mjs|cjs|ts|go|rs|jar)|(?:git|npm|pnpm|yarn|node|npx|dsh|docker|kubectl|gh|cargo|pip|python|python3|pwsh|powershell|bash|sh|curl|wget|rg|grep|sed|awk|find|make|cmake|dotnet|mvn|gradle|ls|cd|cat|echo|set|export|sudo|apt|choco|winget|taskkill|netstat|ipconfig|systemctl|uvicorn|pytest|vitest|jest|tsc|oxlint|eslint|prettier)\b)/
 
-/** Shell-ish glue that only appears in commands, arguments, or code. */
-const SHELL_GLUE_RE = /(?:^|\s)(?:--?[A-Za-z][\w-]*=|--[A-Za-z][\w-]*|\|\||&&|\|\s|\$\(|\$\{|\$[A-Za-z_][\w]*|["'][^"']*["']\s*$)/
-
-/** Fraction of characters that are CJK. */
-export function cjkRatio(text) {
-  const s = typeof text === 'string' ? text : ''
-  if (s === '') return 0
-  const cjk = s.match(CJK_RE)
-  const cjkCount = cjk === null ? 0 : cjk.length
-  // Ratio over non-whitespace characters: indentation must not dilute it.
-  const compact = s.replace(/\s+/g, '')
-  const total = compact === '' ? 0 : [...compact].length
-  return total === 0 ? 0 : cjkCount / total
-}
-
 /**
- * Whether the selection is mostly Chinese already. Mixed text is the reality —
- * Chinese prose quoting an English model id, English prose quoting a Chinese
- * term — so the comparison is between CJK characters and Latin letters, with
- * whitespace and punctuation excluded from both sides: counting them would let
- * indentation decide the verdict.
- * @param text - raw selection.
- * @returns true when translating would be pointless.
+ * Shell-ish glue that only appears in commands, arguments, or code.
+ *
+ * There used to be a `["'][^"']*["']\s*$` alternative here (a trailing quoted
+ * run), and it was a trap: ordinary prose quotes a word at the end of a line all
+ * the time — `He said "hello"`, `The flag is called "verbose"` — so the whole
+ * sentence was masked as code and never reached the model, leaving the card with
+ * untranslated English. The remaining alternatives all require shell punctuation.
  */
-export function looksChinese(text) {
-  const s = String(text ?? '')
-  const compact = s.replace(/\s+/g, '')
-  if (compact === '') return false
-  const cjk = compact.match(CJK_RE)?.length ?? 0
-  const latin = compact.match(/[A-Za-z]/g)?.length ?? 0
-  if (cjk === 0) return false
-  // Letters only: an English identifier inside Chinese prose is still English.
-  return cjk >= latin
-}
+const SHELL_GLUE_RE = /(?:^|\s)(?:--?[A-Za-z][\w-]*=|--[A-Za-z][\w-]*|\|\||&&|\|\s|\$\(|\$\{|\$[A-Za-z_][\w]*)/
 
 /**
  * Whether a plain line is code-like, so it is masked instead of translated:
@@ -87,20 +63,31 @@ export function looksLikeCodeLine(line) {
   return false
 }
 
-/** Character offsets of ``` / ~~~ fenced regions, as inclusive [start, end) pairs. */
+/**
+ * Character offsets of fenced regions, as inclusive [start, end) pairs.
+ *
+ * A fence is closed only by a run of the SAME character that is at least as long
+ * as the one that opened it (CommonMark), which is what makes a four-backtick
+ * block containing a three-backtick block work. Pairing fences as a plain toggle
+ * shifted every following region: the inner opening fence swallowed the prose
+ * after it, the inner closing fence swallowed prose too, and the code in between
+ * was sent to the model unmasked.
+ */
 function fencedRanges(text) {
   const ranges = []
-  const re = /^[ \t]*(```|~~~)[^\n]*$/gm
+  const re = /^[ \t]*(`{3,}|~{3,})[^\n]*$/gm
   let open = null
   let match
   while ((match = re.exec(text)) !== null) {
+    const run = match[1]
     if (open === null) {
-      open = { start: match.index, end: text.length }
-    } else {
-      open.end = match.index + match[0].length
-      ranges.push(open)
-      open = null
+      open = { start: match.index, end: text.length, char: run[0], length: run.length }
+      continue
     }
+    if (run[0] !== open.char || run.length < open.length) continue
+    open.end = match.index + match[0].length
+    ranges.push(open)
+    open = null
   }
   if (open !== null) ranges.push(open)
   return ranges
@@ -153,6 +140,13 @@ export function maskCode(text, options = {}) {
 
 /**
  * Put the removed spans back, in order of appearance.
+ *
+ * Positional and best-effort: a model that drops a placeholder simply loses that
+ * span from the translation (the card still shows the original above it), and a
+ * model that reorders them gets them back in the order they appear. The spans it
+ * could NOT place are reported by {@link missingSpans} so nothing disappears
+ * silently.
+ *
  * @param translated - the model's output, carrying placeholders.
  * @param spans - spans returned by {@link maskCode}.
  * @returns the translated text with originals restored (unmatched placeholders
@@ -160,28 +154,72 @@ export function maskCode(text, options = {}) {
  */
 export function restoreCode(translated, spans) {
   let out = String(translated ?? '')
-  for (const span of spans ?? []) {
+  for (const span of Array.isArray(spans) ? spans : []) {
     if (!out.includes(CODE_PLACEHOLDER)) break
     out = out.replace(CODE_PLACEHOLDER, () => span)
   }
   return out
 }
 
+/**
+ * How many spans {@link restoreCode} could not put back.
+ *
+ * Counted, not matched: the placeholders are interchangeable by design, so the
+ * question is only "did as many come back as went out". The client appends the
+ * unplaced spans to the translation rather than letting the user's command
+ * vanish from the panel.
+ *
+ * @param translated - the model's output.
+ * @param spans - spans returned by {@link maskCode}.
+ * @returns the spans that were never restored, in order.
+ */
+export function missingSpans(translated, spans) {
+  const list = Array.isArray(spans) ? spans : []
+  const returned = String(translated ?? '').split(CODE_PLACEHOLDER).length - 1
+  return list.slice(Math.min(returned, list.length))
+}
+
 /** Collapse runs of blank lines and trailing spaces; keeps paragraph breaks. */
 export function normalizeSelection(text) {
   return String(text ?? '')
     .replace(/\r\n?/g, '\n')
+    // Control characters are noise, and a NUL would also land inside the cache
+    // keys (which are NUL-separated). Tab and newline are legitimate layout.
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
     .replace(/[ \t]+$/gm, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
 
 /**
+ * The source language to believe for one text.
+ *
+ * A pinned source normally wins (the user may know better than a script census).
+ * The one exception is a pin that CONTRADICTS a certain detection: after the swap
+ * button pins the source to the language you were translating INTO, re-selecting a
+ * passage in the language you were reading would otherwise send "translate this
+ * English from Chinese into English" — a paid call that returns the sentence
+ * unchanged. When the text is certain about itself, the text wins.
+ *
+ * @param text - the text.
+ * @param source - the source-language setting (`'auto'` or a code).
+ * @returns `{pinned, detected, effective}` where `effective` is a code or null.
+ */
+export function resolveEffective(text, source) {
+  const pinned = normalizeSourceCode(source)
+  const detected = detectLanguage(text)
+  if (pinned !== SOURCE_AUTO) {
+    return { pinned, detected, effective: detected.certain && detected.code !== pinned ? detected.code : pinned }
+  }
+  return { pinned, detected, effective: detected.certain ? detected.code : null }
+}
+
+/**
  * The language verdict for one text under one policy.
  *
- * `same` is the ONLY thing allowed to stop a translation, and it requires either
- * an explicitly pinned source or a CERTAIN detection: a guess must never turn a
- * click into a refusal.
+ * `same` is the ONLY thing allowed to stop a translation, and it requires a
+ * CERTAIN detection (either of the text itself, or of a text the user pinned to
+ * the target language): a guess must never turn a click into a refusal.
  *
  * @param text - the text (already normalized).
  * @param policy - `{source, target}`; `source` is `'auto'` or a code.
@@ -189,9 +227,7 @@ export function normalizeSelection(text) {
  */
 export function languageVerdict(text, policy = {}) {
   const target = targetCodeOf(policy)
-  const pinned = normalizeSourceCode(policy.source)
-  const detected = detectLanguage(text)
-  const effective = pinned !== SOURCE_AUTO ? pinned : detected.certain ? detected.code : null
+  const { pinned, detected, effective } = resolveEffective(text, policy?.source)
   return {
     target,
     pinned,
@@ -250,27 +286,32 @@ function splitSentences(paragraph) {
 export function chunkText(text, size = CHUNK_CHARS) {
   const source = normalizeSelection(text)
   if (source === '') return []
+  // A non-positive or non-numeric size used to make the hard-slice loop below
+  // never advance (`for (i = 0; i < n; i += 0)`), which grows the array until V8
+  // throws `RangeError: Invalid array length`. No caller passes a size today; this
+  // keeps the function total for the next one.
+  const step = Number.isFinite(size) && Math.floor(size) > 0 ? Math.floor(size) : CHUNK_CHARS
   const pieces = []
   for (const paragraph of source.split(/\n{2,}/)) {
     if (paragraph.trim() === '') continue
-    if ([...paragraph].length <= size) {
+    if ([...paragraph].length <= step) {
       pieces.push(paragraph)
       continue
     }
     let buffer = ''
     for (const sentence of splitSentences(paragraph)) {
       const candidate = buffer === '' ? sentence : `${buffer}${sentence}`
-      if ([...candidate].length <= size) {
+      if ([...candidate].length <= step) {
         buffer = candidate
         continue
       }
       if (buffer !== '') pieces.push(buffer)
-      if ([...sentence].length <= size) {
+      if ([...sentence].length <= step) {
         buffer = sentence
       } else {
         // A single run with no usable break: hard-slice it.
         const chars = [...sentence]
-        for (let i = 0; i < chars.length; i += size) pieces.push(chars.slice(i, i + size).join(''))
+        for (let i = 0; i < chars.length; i += step) pieces.push(chars.slice(i, i + step).join(''))
         buffer = ''
       }
     }
@@ -323,17 +364,32 @@ export const LANGUAGE_CHOICES = [
 /** Where the full label does not fit (the trigger pill, the card chip). */
 const SHORT_LABELS = { 'zh-CN': '中文', 'zh-TW': '繁體' }
 
-/** Resolve a language code (or a legacy label) to the display label. */
+/**
+ * Resolve a language code (or a legacy label) to the display label.
+ *
+ * A non-string or blank value becomes the default label rather than an empty
+ * string: the host applies this to untrusted request fields (`payload.lang` can be
+ * `[]`, `0` or `{}`), and a prompt line reading "Translate it into ." is worse
+ * than a language nobody asked for.
+ *
+ * @param code - a language code, a label, or anything else.
+ * @returns a non-empty display label.
+ */
 export function languageLabel(code) {
+  if (typeof code !== 'string' || code.trim() === '') return languageLabel(DEFAULT_TARGET_CODE)
   const hit = LANGUAGE_CHOICES.find((entry) => entry.code === code)
   if (hit !== undefined) return hit.label
   const byLabel = LANGUAGE_CHOICES.find((entry) => entry.label === code)
-  return byLabel === undefined ? String(code ?? DEFAULT_TARGET_CODE) : byLabel.label
+  return byLabel === undefined ? code : byLabel.label
 }
 
 /** Resolve a language code to a label short enough for a chip. */
 export function languageShortLabel(code) {
-  return SHORT_LABELS[code] ?? languageLabel(code)
+  const resolved = typeof code === 'string' && code.trim() !== '' ? code : DEFAULT_TARGET_CODE
+  const direct = SHORT_LABELS[resolved]
+  if (direct !== undefined) return direct
+  const hit = LANGUAGE_CHOICES.find((entry) => entry.code === resolved || entry.label === resolved)
+  return hit === undefined ? resolved : SHORT_LABELS[hit.code] ?? hit.label
 }
 
 /**
@@ -371,15 +427,36 @@ export function targetCodeOf(policy) {
 export const MIN_DETECT_LETTERS = 4
 
 /** Latin function words, one set per language. Frequency IS the signal. */
-const LATIN_STOPWORDS = {
-  en: 'a about after all also an and any are as at be because before but by can could did do does for from had has have he her here him his how i if in into is it its just let may me might more most must my no not of on only or other our out over should so some such than that the their them then there these they this those to up us very was we were what when where which while who why will with without would you your'.split(' '),
-  es: 'a al algo antes aqui asi bien cada como con contra cual cuando de del desde donde dos el ella ellas ellos en entre era Eras es esa ese eso esta este esto fue ha hasta hay la las le les lo los mas me mi mucho muy no nos o otra para pero poco por porque que quien se segun ser si sin sobre son su sus te tiene todo tu un una uno y ya'.split(' '),
-  fr: 'a ai ainsi au aux avec avant beaucoup bien ce cette ces comme comment dans de des du elle elles en encore est et etait etre eux il ils je la le les leur leurs lui ma mais me meme mes moi mon ne nos notre nous on ou oui par parce pas peu plus pour pourquoi quand que quel quelle qui sa sans se ses si soi son sont sous sur ta te tes toi ton tous tout toute tres tu un une vos votre vous y'.split(' '),
-  de: 'aber als also am an auch auf aus bei bin bis da damit dann das dass dein dem den der des dessen die dies diese doch dort du durch ein eine einem einen einer eines er es etwas fur gegen gewesen hat hatte haben hier ich im in ist ja jede jeder jedes kein keine kann konnen mit nach nicht noch nur oder ohne sein seine sich sie sind so soll sondern sonst uber um und uns unter viel vom von vor war waren was weil wenn werden wie wieder wir wird wo zu zum zur zwischen'.split(' '),
-  pt: 'a ao aos ao as apenas ate com como da das de dela dele depois do dos e ela ele em entre era essa esse esta este eu foi ha isso isto ja mais mas me mesmo meu na nas nem no nos o os ou para pela pelo por porque que quem se sem ser seu so sua suas tem tudo um uma voce'.split(' '),
-  it: 'a ai al alla alle anche avendo avere ben che chi ci come con cosa da dal dalla delle di e era essere fa fare fino gli ha hanno i il in io la le lei li lo loro ma me mi mia mie mio molto ne negli nel nella nello noi non o ogni per perche piu poi quando quel quella quello questa questi questo se sei si sia solo sono sopra suo su tra tu tua tuo un una uno vi voi'.split(' '),
-  vi: 'anh ay ba bang bao ben boi cac can chi cho chua cung cua duoc gi giua hai hay ho hoac khi khong la lai lam mot moi nao nay nen neu nguoi nhung no nua phai qua ra rang roi se su that thi trong tu tung va van ve vi voi'.split(' '),
+const LATIN_WORDS = {
+  en: 'a about after all also an and any are as at be because before but by can could did do does for from had has have he her here him his how i if in into is it its just let may me might more most must my no not of on only or other our out over should so some such than that the their them then there these they this those to up us very was we were what when where which while who why will with without would you your',
+  es: 'a al algo antes aqui asi bien cada como con contra cual cuando de del desde donde dos el ella ellas ellos en entre era es esa ese eso esta este esto fue ha hasta hay la las le les lo los mas me mi mucho muy no nos o otra para pero poco por porque que quien se segun ser si sin sobre son su sus te tiene todo tu un una uno y ya',
+  fr: 'a ai ainsi au aux avec avant beaucoup bien ce cette ces comme comment dans de des du elle elles en encore est et etait etre eux il ils je la le les leur leurs lui ma mais me meme mes moi mon ne nos notre nous on ou oui par parce pas peu plus pour pourquoi quand que quel quelle qui sa sans se ses si soi son sont sous sur ta te tes toi ton tous tout toute tres tu un une vos votre vous y',
+  de: 'aber als also am an auch auf aus bei bin bis da damit dann das dass dein dem den der des dessen die dies diese doch dort du durch ein eine einem einen einer eines er es etwas fur gegen gewesen hat hatte haben hier ich im in ist ja jede jeder jedes kein keine kann konnen mit nach nicht noch nur oder ohne sein seine sich sie sind so soll sondern sonst uber um und uns unter viel vom von vor war waren was weil wenn werden wie wieder wir wird wo zu zum zur zwischen',
+  pt: 'a ao aos apenas ate aqui antes cada com como contra quando da das de dela dele depois do dos durante e ela ele em entre era essa esse esta este eu foi ha isso isto ja mais mas me mesmo meu muito na nas nem no nos o os onde ou para pela pelo por porque que quem se sem ser seu sobre so sua suas tambem tem tudo um uma voce',
+  it: 'a ai al alla alle anche avendo avere ben che chi ci come con cosa da dal dalla delle di e era essere fa fare fino gli ha hanno i il in io la le lei li lo loro ma me mi mia mie mio molto ne negli nel nella nello noi non o ogni per perche piu poi quando quel quella quello questa questi questo se sei si sia solo sono sopra suo su tra tu tua tuo un una uno vi voi',
+  vi: 'anh ay ba bang bao ben boi cac can chi cho chua cung cua duoc gi giua hai hay ho hoac khi khong la lai lam mot moi nao nay nen neu nguoi nhung no nua phai qua ra rang roi se su that thi trong tu tung va van ve vi voi',
 }
+
+/** The same lists as lookup sets (the vote runs over every token of every card). */
+const LATIN_STOPWORDS = Object.fromEntries(
+  Object.entries(LATIN_WORDS).map(([code, words]) => [code, new Set(words.split(' '))]),
+)
+
+/**
+ * How many candidate languages list each word.
+ *
+ * A word two languages share (`a`, `in`, `se`, `que`) proves nothing about which one
+ * you are reading: Spanish and Portuguese share half their function words, and
+ * Italian shares `in`/`a` with English. So certainty needs at least one hit on a word
+ * only ONE candidate owns — that, a minimum, and a lead are the whole rule.
+ */
+const LATIN_OWNERS = (() => {
+  const owners = new Map()
+  for (const words of Object.values(LATIN_STOPWORDS)) {
+    for (const word of words) owners.set(word, (owners.get(word) ?? 0) + 1)
+  }
+  return owners
+})()
 
 /** Diacritics and letters that exist in exactly one language of the list. */
 const DIACRITIC_HINTS = [
@@ -402,6 +479,16 @@ const HAN_VARIANTS = [
   ['題', '题'], ['東', '东'], ['車', '车'], ['門', '门'], ['馬', '马'], ['鳥', '鸟'],
   ['語', '语'], ['讀', '读'], ['寫', '写'], ['聽', '听'], ['幾', '几'], ['長', '长'],
 ]
+
+/**
+ * Kanji that exist ONLY in Japanese: each is the shinjitai form of a character
+ * whose traditional and simplified Chinese forms are both different.
+ *
+ * Without this, a Kanji-only Japanese phrase is indistinguishable from Chinese by
+ * script alone — and being called "Chinese" is exactly what makes it refused when
+ * the target is Chinese. (A phrase with kana is already handled above.)
+ */
+const JAPANESE_ONLY_KANJI = '図実発検対経沢済焼顔駅価単変売読亜圧塩剣択訳覧観権産齢拡続総'
 
 /** Characters matching one Unicode script. */
 function scriptCount(text, script) {
@@ -450,6 +537,26 @@ function detectResult(code, script, confidence, certain) {
  */
 export function detectLanguage(text) {
   const source = String(text ?? '')
+  const cached = DETECT_CACHE.get(source)
+  if (cached !== undefined) return cached
+  const result = detectUncached(source)
+  // Bounded memo: this runs at RENDER time for every card in the sidebar (the
+  // x→y chip), and a full scan of a 8k-character card costs ~2 ms — times a
+  // hundred cards, on every streaming delta. Deterministic function, so caching
+  // is free correctness-wise.
+  if (DETECT_CACHE.size >= DETECT_CACHE_LIMIT) DETECT_CACHE.clear()
+  DETECT_CACHE.set(source, result)
+  return result
+}
+
+/** Memo for {@link detectLanguage}; cleared wholesale when it grows too far. */
+const DETECT_CACHE = new Map()
+
+/** How many texts to memoize. */
+const DETECT_CACHE_LIMIT = 200
+
+/** The actual detector, without the memo. */
+function detectUncached(source) {
   const kana = scriptCount(source, 'Hiragana') + scriptCount(source, 'Katakana')
   const hangul = scriptCount(source, 'Hangul')
   // Kana and Hangul are decisive on a single character: Japanese prose is
@@ -465,16 +572,21 @@ export function detectLanguage(text) {
   const devanagari = scriptCount(source, 'Devanagari')
   const letters = han + latin + cyrillic + arabic + thai + devanagari
 
-  // Han dominance, measured against Latin exactly like `looksChinese` does — so
-  // "Chinese prose quoting an API name" stays Chinese. No length floor in this
-  // branch: Han is a script no other language in the list writes, so even 你好
-  // is decisive, while a two-letter Latin word is not a language.
+  // Han dominance, measured against Latin: "Chinese prose quoting an API name"
+  // stays Chinese. `certain` needs a real amount of Han — a one- or two-character
+  // fragment (確認, 你好) is a guess, and a guess must never refuse a translation.
   if (han > 0 && han >= latin) {
+    if (hasJapaneseOnlyKanji(source)) return detectResult('ja', 'han-jp', 0.85, true)
     const ratio = han / (han + latin)
-    return detectResult(hanVariantCode(source), 'han', ratio, true)
+    return detectResult(hanVariantCode(source), 'han', ratio, han >= MIN_DETECT_LETTERS)
   }
 
-  // The same argument for the other exclusive scripts.
+  // The same argument for the other exclusive scripts — except that "one script,
+  // one language" is FALSE for them: Cyrillic covers Russian/Ukrainian/Bulgarian,
+  // Arabic covers Persian/Urdu/Pashto, Devanagari covers Hindi/Marathi/Nepali. So
+  // the code is reported as a guess and `certain` stays false: naming Ukrainian
+  // "Russian" and then refusing to translate it is the same bug kana fixed for
+  // Japanese.
   const others = [
     ['ru', cyrillic],
     ['ar', arabic],
@@ -482,7 +594,10 @@ export function detectLanguage(text) {
     ['hi', devanagari],
   ]
   const other = others.reduce((best, entry) => (entry[1] > best[1] ? entry : best), ['', 0])
-  if (other[1] > 0 && other[1] >= latin) return detectResult(other[0], 'other', 0.9, true)
+  if (other[1] > 0 && other[1] >= latin) {
+    const singleLanguage = other[0] === 'th'
+    return detectResult(other[0], 'other', singleLanguage ? 0.9 : 0.6, singleLanguage)
+  }
 
   // Latin is the only branch that has to be VOTED on, so it is the only one that
   // needs evidence before it may name a language.
@@ -490,17 +605,37 @@ export function detectLanguage(text) {
 
   const tokens = tokensOf(source)
   const scored = Object.entries(LATIN_STOPWORDS)
-    .map(([code, words]) => ({ code, hits: tokens.filter((token) => words.includes(token)).length }))
-    .sort((left, right) => right.hits - left.hits)
+    .map(([code, words]) => {
+      const hits = tokens.filter((token) => words.has(token))
+      // Words this language does not share with any other candidate.
+      const exclusive = hits.filter((token) => LATIN_OWNERS.get(token) === 1).length
+      return { code, hits: hits.length, exclusive }
+    })
+    .sort((left, right) => right.hits - left.hits || right.exclusive - left.exclusive)
   const top = scored[0]
   const second = scored[1]
   const hinted = DIACRITIC_HINTS.filter((hint) => hint.re.test(source)).map((hint) => hint.code)
 
-  if (top.hits >= 3 && top.hits > second.hits) return detectResult(top.code, 'latin', 0.85, true)
+  // Certainty needs a lead, a minimum, AND at least one word that is nobody else's:
+  // `The plugin keeps every finished translation in a small local cache.` leads
+  // English 3 to Italian's 2 (`in`, `a` are both), which a margin rule alone would
+  // call a coin flip — but only English has `the`. A decisive diacritic is the other
+  // way to be sure without voting at all.
+  if (top.hits >= 3 && top.hits > second.hits && top.exclusive >= 1) {
+    return detectResult(top.code, 'latin', 0.85, true)
+  }
   if (hinted.length > 0) return detectResult(hinted[0], 'latin', 0.8, true)
-  if (top.hits === 2 && top.hits > second.hits) return detectResult(top.code, 'latin', 0.7, true)
-  if (top.hits >= 1) return detectResult(top.code, 'latin', top.hits >= 2 ? 0.5 : 0.35, false)
+  if (top.hits >= 2) return detectResult(top.code, 'latin', 0.5, false)
+  if (top.hits >= 1) return detectResult(top.code, 'latin', 0.35, false)
   return detectResult(null, 'latin', 0, false)
+}
+
+/** Whether a Han text carries at least one Japanese-only shinjitai character. */
+function hasJapaneseOnlyKanji(text) {
+  for (const char of JAPANESE_ONLY_KANJI) {
+    if (text.includes(char)) return true
+  }
+  return false
 }
 
 /**
@@ -510,10 +645,7 @@ export function detectLanguage(text) {
  * @returns a code, or null when nothing is known (the model then decides).
  */
 export function effectiveSource(text, source) {
-  const pinned = normalizeSourceCode(source)
-  if (pinned !== SOURCE_AUTO) return pinned
-  const detected = detectLanguage(text)
-  return detected.certain ? detected.code : null
+  return resolveEffective(text, source).effective
 }
 
 // ---------------------------------------------------------------------------
@@ -605,8 +737,25 @@ export function modeById(id, options = {}) {
     TRANSLATION_MODES.find((mode) => mode.id === raw) ?? TRANSLATION_MODES.find((mode) => mode.label === raw)
   const mode = hit ?? TRANSLATION_MODES[0]
   if (mode.id !== 'custom') return mode
-  const instruction = String(options?.customInstruction ?? '').trim().slice(0, MAX_INSTRUCTION_CHARS)
+  const instruction = sanitizeInstruction(options?.customInstruction)
   return instruction === '' ? TRANSLATION_MODES[0] : { ...mode, style: instruction }
+}
+
+/**
+ * One-line form of a custom requirement.
+ *
+ * Whitespace runs collapse to single spaces because the style is a LINE of the
+ * system prompt: a newline in the box would let the text start its own `Rules:`
+ * section and inject extra numbered rules. Truncation keeps the prompt bounded.
+ *
+ * @param value - the raw requirement.
+ * @returns the sanitized requirement ('' when there is nothing usable).
+ */
+export function sanitizeInstruction(value) {
+  return String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_INSTRUCTION_CHARS)
 }
 
 /** The label of one gear id (for the card chip and the toolbar). */
@@ -697,6 +846,10 @@ export function swapPair(pair, detected) {
   const source = normalizeSourceCode(pair?.source)
   const target = targetCodeOf(pair)
   if (source === SOURCE_AUTO) return { source: target, target: pickSwapTarget(target, detected) }
+  // A pair that is ALREADY collapsed (a hand-edited settings blob, a downgrade
+  // from a version that allowed it) must not be handed straight back: the whole
+  // point of the pair invariant is that this state refuses every card.
+  if (source === target) return { source: target, target: pickSwapTarget(target, detected) }
   return { source: target, target: source }
 }
 

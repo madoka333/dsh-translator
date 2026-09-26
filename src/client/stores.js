@@ -132,20 +132,23 @@ export function refKey(text, sessionKey) {
 }
 
 /**
- * Identity of one ANSWER: same text, same target, same gear, same source hint ⇒
- * the same translation, and the in-page cache must not confuse two of them.
+ * Identity of one ANSWER: same text, same target, same gear, same source hint,
+ * same custom requirement ⇒ the same translation.
  *
  * Mirror of the host's `translationKey`, minus the route (the browser does not
- * care which model answered — a finished card is a finished card).
+ * care which model answered — a finished card is a finished card). The custom
+ * requirement belongs here for the same reason it belongs there: editing it must
+ * not serve an answer written under the old one.
  *
- * @param spec - `{lang, mode, sourceLang}` as stored on the reference.
+ * @param spec - `{lang, mode, sourceLang, instruction}` as stored on the reference.
  * @param text - the source text.
  * @returns the cache key.
  */
 export function answerKeyOf(spec, text) {
   const mode = spec?.mode ?? LEGACY_MODE
   const source = spec?.sourceLang ?? LEGACY_SOURCE
-  return `${spec?.lang ?? ''}\u0000${mode}\u0000${source}\u0000${text}`
+  const instruction = spec?.instruction ?? ''
+  return `${spec?.lang ?? ''}\u0000${mode}\u0000${source}\u0000${instruction}\u0000${text}`
 }
 
 /** The spec of one stored reference, with the pre-beta.2 defaults filled in. */
@@ -154,13 +157,19 @@ export function specOfRef(ref) {
     lang: ref?.lang ?? '',
     mode: ref?.mode ?? LEGACY_MODE,
     sourceLang: ref?.sourceLang ?? LEGACY_SOURCE,
+    instruction: ref?.instruction ?? '',
   }
 }
 
-/** Whether a card already carries this exact pair and gear. */
+/** Whether a card already carries this exact pair, gear and requirement. */
 function sameSpec(spec, ref) {
   const current = specOfRef(ref)
-  return spec.lang === current.lang && spec.mode === current.mode && spec.sourceLang === current.sourceLang
+  return (
+    spec.lang === current.lang &&
+    spec.mode === current.mode &&
+    spec.sourceLang === current.sourceLang &&
+    (spec.instruction ?? '') === current.instruction
+  )
 }
 
 /** UI settings store, persisted under one localStorage key. */
@@ -224,7 +233,13 @@ export function writeDraft(sessionKey, text) {
 export class RefsStore extends Observable {
   #cache = new Map()
   #controllers = new Map()
-  #sessionKey = 'default'
+  /**
+   * Starts EMPTY, not `'default'`: `setSession` early-returns when the key is
+   * unchanged, so a store that already claimed `'default'` never loaded the shared
+   * bucket — the namespace existed on disk and was write-only, which is exactly the
+   * "degrade to a shared bucket rather than to lost cards" promise it was for.
+   */
+  #sessionKey = ''
 
   /** @param sessionKey - storage namespace (the active Session id). */
   constructor(sessionKey = 'default') {
@@ -234,7 +249,9 @@ export class RefsStore extends Observable {
 
   /**
    * Switch the storage namespace (session switch). Live streams of the previous
-   * session are aborted; their partial text is kept in that session's storage.
+   * session are aborted; whatever those streams had already produced stays in that
+   * session's storage (a status change is persisted, so a partial answer is not
+   * lost even though the run is).
    */
   setSession(sessionKey) {
     const key = typeof sessionKey === 'string' && sessionKey !== '' ? sessionKey : 'default'
@@ -242,7 +259,17 @@ export class RefsStore extends Observable {
     this.#abortAll()
     this.#sessionKey = key
     const stored = readJson(`${REFS_PREFIX}${key}`, { refs: [] })
-    const refs = Array.isArray(stored?.refs) ? stored.refs.filter(isStoredRef).map(normalizeStoredRef) : []
+    const raw = Array.isArray(stored?.refs) ? stored.refs.filter(isStoredRef) : []
+    const refs = []
+    const seen = new Set()
+    for (const entry of raw) {
+      const ref = normalizeStoredRef(entry, key)
+      // Deduplicate by identity: a version upgrade can recompute a key, and two
+      // rows for one text would render two cards for the same passage.
+      if (seen.has(ref.key)) continue
+      seen.add(ref.key)
+      refs.push(ref)
+    }
     this.commit({ refs: refs.slice(0, MAX_REFS), active: refs[0]?.key ?? null })
   }
 
@@ -273,7 +300,7 @@ export class RefsStore extends Observable {
   /**
    * Add one reference (deduplicated): an already-known text is revealed and
    * re-raised to the top instead of duplicated.
-   * @param input - `{text, kind, lang, mode, sourceLang, sourceLabel}`.
+   * @param input - `{text, kind, lang, mode, sourceLang, instruction, sourceLabel}`.
    * @param translator - `{chunks, translate}` runner.
    * @returns the reference key.
    */
@@ -283,6 +310,7 @@ export class RefsStore extends Observable {
       lang: input.lang,
       mode: input.mode ?? LEGACY_MODE,
       sourceLang: input.sourceLang ?? LEGACY_SOURCE,
+      instruction: input.instruction ?? '',
     }
     const existing = this.find(key)
     if (existing !== undefined) {
@@ -397,12 +425,13 @@ export class RefsStore extends Observable {
       for (const unit of units) {
         if (controller.signal.aborted) return
         current = ''
-        await translator.translate({
+        const returned = await translator.translate({
           text: unit,
           kind: ref.kind,
           lang: ref.lang,
           mode: ref.mode ?? LEGACY_MODE,
           sourceLang: ref.sourceLang ?? LEGACY_SOURCE,
+          instruction: ref.instruction ?? '',
           signal: controller.signal,
           onStart: (info) => {
             this.#patch(key, { routeLabel: info.label })
@@ -412,6 +441,13 @@ export class RefsStore extends Observable {
             this.#patch(key, { translation: visibleText(), status: 'streaming' })
           },
         })
+        // The translator's RETURN VALUE is authoritative, because it is the
+        // restored text (masked code spans put back). Rebuilding the answer from
+        // the deltas alone cannot represent a placeholder restored anywhere but at
+        // the very end: the card kept a literal ⟪code⟫ and got the code appended
+        // twice, or lost the code entirely when the span was shorter than the
+        // placeholder. The deltas stay the streaming view; this is the answer.
+        if (typeof returned === 'string' && returned !== '') current = returned
         pieces.push(current)
         current = ''
       }
@@ -430,6 +466,12 @@ export class RefsStore extends Observable {
       this.#patch(key, { translation: accumulated, status: 'done', error: null, cached: ref.cached === true })
     } catch (error) {
       if (controller.signal.aborted) {
+        // A retry or a cancel may have replaced this run while it was aborting, and
+        // the NEW run owns the card now: patching `cancelled` here would freeze a
+        // card that is actively streaming (已取消 + empty text + a 重新翻译 button
+        // while the answer is on its way). `cancel()` patches its own state, and
+        // `setSession` replaced the list entirely, so nothing is lost by leaving.
+        if (this.#controllers.get(key) !== controller) return
         this.#patch(key, { status: 'cancelled' })
         return
       }
@@ -458,6 +500,11 @@ export class RefsStore extends Observable {
   #patch(key, patch) {
     const refs = this.list().map((ref) => (ref.key === key ? { ...ref, ...patch } : ref))
     this.commit({ ...this.getSnapshot(), refs })
+    // Persist on every STATUS change, not only at the end of a run. The old code
+    // wrote storage in `#run`'s `finally`, so a card that was streaming when the
+    // Session changed (or the page reloaded) came back as `pending` with no runner
+    // — 排队中 forever, for a request that no longer exists.
+    if (patch !== undefined && 'status' in patch) this.#persist()
   }
 
   /** Persist the current list (done/error cards only — partials survive too). */
@@ -492,14 +539,30 @@ function isStoredRef(value) {
 }
 
 /**
- * Fill the fields a card written before beta.2 cannot have.
+ * Fill the fields a card written before beta.2 cannot have, and repair the ones
+ * the upgrade invalidated.
  *
- * The alternative — defaulting on every read — means a card whose gear is
- * `undefined` in one code path and `'general'` in another, and the spec
- * comparison that decides whether to re-translate uses exactly those fields.
+ * Three repairs, all of which used to be silent data loss:
+ * 1. `mode` / `sourceLang` / `instruction` defaults, so the spec comparison that
+ *    decides whether to re-translate sees a complete spec.
+ * 2. The KEY is recomputed. It used to hash `session + target language + text`, and
+ *    a stored key that no longer matches the fresh one makes the same passage
+ *    create a SECOND card instead of revealing the existing one.
+ * 3. A card that was mid-stream has no runner any more — showing it as 排队中 would
+ *    promise a translation that will never arrive.
+ *
  * @param ref - one persisted reference.
- * @returns the same reference with `mode` and `sourceLang` present.
+ * @param sessionKey - the namespace it was read from (part of its identity).
+ * @returns the repaired reference.
  */
-function normalizeStoredRef(ref) {
-  return { ...ref, mode: ref.mode ?? LEGACY_MODE, sourceLang: ref.sourceLang ?? LEGACY_SOURCE }
+function normalizeStoredRef(ref, sessionKey) {
+  const status = ref.status === 'pending' || ref.status === 'streaming' ? 'cancelled' : ref.status
+  return {
+    ...ref,
+    key: refKey(ref.text, sessionKey),
+    mode: ref.mode ?? LEGACY_MODE,
+    sourceLang: ref.sourceLang ?? LEGACY_SOURCE,
+    instruction: ref.instruction ?? '',
+    status,
+  }
 }

@@ -252,6 +252,10 @@ function makeReactStub() {
   createElement.useEffect = (effect) => {
     if (typeof effect === 'function') capturedEffects.push(effect)
   }
+  // The pane switches the store's Session namespace in a LAYOUT effect (so the first
+  // paint cannot show the previous Session's cards). The stub records it like any
+  // other effect — the tests replay effects by calling them.
+  createElement.useLayoutEffect = createElement.useEffect
   createElement.useRef = (initial) => ({ current: initial })
   createElement.useCallback = (callback) => callback
   createElement.useMemo = (factory) => factory()
@@ -274,6 +278,7 @@ function makeReactModule(createElement) {
     Fragment: createElement.Fragment,
     useState: createElement.useState,
     useEffect: createElement.useEffect,
+    useLayoutEffect: createElement.useLayoutEffect,
     useRef: createElement.useRef,
     useCallback: createElement.useCallback,
     useMemo: createElement.useMemo,
@@ -854,7 +859,9 @@ test('the composer sits at the very bottom of the pane, under the drop strip', a
   assert.ok(dropIndex < children.length - 1, 'the composer comes after the drop strip')
 
   assert.equal(typeof composerInput(tree), 'object', 'the composer renders a textarea')
-  assert.ok(renderText(tree).includes('beta'), 'the beta build is labelled in the pane')
+  // The `beta` badge is gone in 0.2.0: the feature shipped. Its absence is asserted
+  // so a stale bundle (or a half-reverted change) is visible instead of silent.
+  assert.equal(renderText(tree).includes('beta'), false, 'the released pane carries no beta badge')
 })
 
 test('Enter commits the staged text as one more reference and clears the draft', async () => {
@@ -1701,6 +1708,189 @@ test('a gear change re-runs the cards, and a pair change never re-runs a card in
   assert.equal(bodies().length, 3, 'a real target change re-runs the card')
   assert.equal(bodies()[2].lang, 'ja')
   assert.equal(refs()[0].lang, 'ja')
+})
+
+// ---------------------------------------------------------------------------
+// The masked-code round trip, through the REAL pipeline.
+//
+// This was a critical pre-release find: `#run` rebuilt the answer from the
+// streaming deltas alone, and `translatorFor` emitted the restored text as a TAIL
+// SLICE — correct only when the restored text starts with the streamed one. A
+// placeholder anywhere else left a literal ⟪code⟫ in the card, appended the code a
+// second time, or dropped it entirely. Driving the real runtime, the real
+// translator, the real SSE transport and the real store is the only way to catch it.
+// ---------------------------------------------------------------------------
+
+/** One SSE translation, as the host would stream it. */
+function sseAnswer(text) {
+  return [
+    `data: ${JSON.stringify({ type: 'start', route: { provider: 'deepseek-official', model: 'deepseek-flash' }, target: '简体中文' })}`,
+    '',
+    `data: ${JSON.stringify({ type: 'delta', text })}`,
+    '',
+    `data: ${JSON.stringify({ type: 'done', chars: [...text].length })}`,
+    '',
+    '',
+  ].join('\n')
+}
+
+/** Mount the client with known settings and hand back the REAL runtime. */
+async function mountRuntime(settings = { maskCode: true }) {
+  installFakeDom()
+  globalThis.localStorage.setItem('dsh-translator:settings', JSON.stringify(settings))
+  const registration = await loadClientBundle()
+  const createElement = makeReactStub()
+  const { ctx, calls } = makeContext()
+  const exports = registration.factory((specifier) => {
+    if (specifier === 'react') return makeReactModule(createElement)
+    if (specifier === 'react-dom') return { createPortal: (node) => node }
+    if (specifier === 'react-dom/client') return { createRoot: () => ({ render() {}, unmount() {} }) }
+    throw new Error(`unexpected external require: ${specifier}`)
+  })
+  exports.apply(ctx)
+  const seat = calls.slots.find((entry) => entry.name === 'sidebar.right.pane.tab')
+  const host = findElement(
+    seat.component({ sessionId: 'session-mask' }),
+    (node) => typeof node?.props?.runtime?.addManual === 'function',
+  )
+  assert.ok(host !== undefined, 'the seat must hand the pane the plugin runtime')
+  return { runtime: host.props.runtime, store: host.props.store }
+}
+
+test('a code line comes back as code, in place, exactly once', async () => {
+  const { runtime, store } = await mountRuntime()
+  const requests = stubFetch(sseAnswer('先跑这个：\n⟪code⟫\n然后检查输出。'))
+
+  runtime.addManual('Run this first:\nnpm install\nThen check the output.')
+  await settle()
+
+  assert.equal(requests.length, 1, 'one card, one call')
+  const sent = JSON.parse(requests[0].init.body)
+  assert.equal(sent.text.includes('npm install'), false, 'the command is masked before it is sent')
+  assert.equal(sent.text.includes('⟪code⟫'), true)
+
+  const ref = store.getSnapshot().refs[0]
+  assert.equal(ref.status, 'done')
+  assert.equal(ref.translation.includes('⟪code⟫'), false, 'the placeholder must never reach the card')
+  assert.equal(ref.translation, '先跑这个：\nnpm install\n然后检查输出。', 'the code comes back in place, once')
+})
+
+test('a code line the model dropped is appended instead of vanishing', async () => {
+  const { runtime, store } = await mountRuntime()
+  stubFetch(sseAnswer('先跑这个，然后检查输出。'))
+  runtime.addManual('Run this first:\nnpm install\nThen check the output.')
+  await settle()
+
+  const ref = store.getSnapshot().refs[0]
+  assert.equal(ref.status, 'done')
+  assert.ok(ref.translation.startsWith('先跑这个'), ref.translation)
+  assert.ok(ref.translation.includes('npm install'), `the dropped command must stay visible (got ${ref.translation})`)
+})
+
+test('a unit that is entirely code is passed through without a model call', async () => {
+  const { runtime, store } = await mountRuntime()
+  const requests = stubFetch(sseAnswer('never called'))
+  runtime.addManual('npm run build --filter dsh-translator')
+  await settle()
+
+  assert.equal(requests.length, 0, 'a unit that is entirely code costs nothing')
+  assert.equal(store.getSnapshot().refs[0].translation, 'npm run build --filter dsh-translator')
+})
+
+// ---------------------------------------------------------------------------
+// Run lifecycle: the three ways a card used to end up frozen or duplicated.
+// ---------------------------------------------------------------------------
+
+test('a retry that aborts a run leaves the card to the NEW run', async () => {
+  const { RefsStore } = await import('../src/client/stores.js')
+  installFakeDom()
+  const store = new RefsStore('session-abort')
+  const blocking = {
+    chunks: (text) => [text],
+    translate: (request) =>
+      new Promise((resolve, reject) => {
+        request.onDelta?.('partial')
+        request.signal?.addEventListener('abort', () => reject(new Error('aborted')))
+      }),
+  }
+  const quick = {
+    chunks: (text) => [text],
+    translate: async (request) => {
+      request.onDelta?.('NEW')
+      return 'NEW'
+    },
+  }
+  const key = store.add(
+    { text: 'some english text here', kind: 'selection', lang: 'zh-CN', mode: 'general', sourceLang: 'auto' },
+    blocking,
+  )
+  await settle()
+  assert.equal(store.find(key).status, 'streaming')
+
+  // Two gear changes in quick succession: the first run is aborted while it is in
+  // flight, and its own catch used to patch `cancelled` AFTER the replacement had
+  // already started — a card reading 已取消 with an empty translation and a
+  // 重新翻译 button, while the answer was still streaming.
+  store.retry(key, quick, { mode: 'academic' })
+  await settle()
+  const ref = store.find(key)
+  assert.equal(ref.status, 'done', 'the replacement run owns the card')
+  assert.equal(ref.translation, 'NEW')
+  assert.equal(ref.mode, 'academic')
+})
+
+test('a card that was streaming when the page went away comes back as cancelled, not 排队中', async () => {
+  const { RefsStore } = await import('../src/client/stores.js')
+  installFakeDom()
+  globalThis.localStorage.setItem(
+    'dsh-translator:refs:session-restore',
+    JSON.stringify({
+      refs: [
+        {
+          // A key from the PREVIOUS identity scheme (session + target + text).
+          key: 'stale-hash:42',
+          text: 'some english text here',
+          kind: 'selection',
+          lang: 'zh-CN',
+          status: 'streaming',
+          translation: 'partial',
+          sourceLabel: '',
+        },
+      ],
+    }),
+  )
+  const store = new RefsStore('session-restore')
+  const ref = store.list()[0]
+  assert.equal(ref.status, 'cancelled', 'there is no runner for it any more, so 排队中 would be a lie')
+  assert.equal(ref.translation, 'partial', 'and what had already arrived is kept')
+
+  // The key is recomputed for the CURRENT identity, so re-selecting the same text
+  // reveals this card instead of quietly creating a second one for the same passage.
+  const again = store.add(
+    { text: 'some english text here', kind: 'selection', lang: 'zh-CN', mode: 'general', sourceLang: 'auto' },
+    { chunks: (text) => [text], translate: async () => 'x' },
+  )
+  assert.equal(again, ref.key, 'add() computes the migrated key')
+  assert.equal(store.list().length, 1, 'one card per text survives the upgrade')
+})
+
+test('the shared default bucket is read back, not just written to', async () => {
+  const { RefsStore } = await import('../src/client/stores.js')
+  installFakeDom()
+  globalThis.localStorage.setItem(
+    'dsh-translator:refs:default',
+    JSON.stringify({
+      refs: [
+        { key: 'k', text: 'shared bucket text', kind: 'selection', lang: 'zh-CN', status: 'done', translation: 'x' },
+      ],
+    }),
+  )
+  // `setSession` early-returns when the key is unchanged, so a store whose initial
+  // key was already `'default'` never loaded the bucket — the documented
+  // "degrade to a shared bucket rather than to lost cards" was write-only.
+  const store = new RefsStore('default')
+  assert.equal(store.sessionKey(), 'default')
+  assert.equal(store.list().length, 1, 'constructing with the shared key must load it')
 })
 
 // ---------------------------------------------------------------------------

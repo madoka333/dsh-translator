@@ -71,10 +71,11 @@ async function handleTranslate(req, res, deps) {
 
   const url = new URL(req.url ?? '/', `http://${host}`)
   if (url.pathname.endsWith('/health')) {
+    const [healthy] = await deps.resolveRoute()
     writeJson(res, 200, {
       ok: true,
       llm: deps.llmAvailable(),
-      route: deps.resolveRoute()[0] ?? null,
+      route: healthy ?? null,
     })
     return
   }
@@ -106,7 +107,7 @@ async function handleTranslate(req, res, deps) {
     return
   }
 
-  const [route] = deps.resolveRoute(payload?.route)
+  const [route] = await deps.resolveRoute(payload?.route)
   if (route === undefined) {
     writeJson(res, 503, {
       ok: false,
@@ -130,13 +131,18 @@ async function handleTranslate(req, res, deps) {
   // happened" becomes a bug report.
   const instruction = instructionOf(payload?.instruction ?? deps.config().customInstruction)
   const style = mode === 'custom' ? instruction : ''
-  const cached = deps.cache.get(translationKey(text, target, route, { mode, source, style }))
+  // ONE key for both the read and the write. The two used to be spelled as two
+  // separate object literals that happened to agree; a future edit making them
+  // differ would silently split the cache (extra model calls) or serve the wrong
+  // answer, with nothing to catch it.
+  const cacheKey = translationKey(text, target, route, { mode, source, style })
+  const cached = deps.cache.get(cacheKey)
   if (cached !== undefined) {
     writeCachedSse(res, route, cached)
     return
   }
 
-  await streamTranslation({ req, res, deps, text, kind, target, mode, source, instruction, route })
+  await streamTranslation({ req, res, deps, cacheKey, text, kind, target, mode, source, instruction, route })
 }
 
 /** Truncate one custom instruction to the length the prompt may carry. */
@@ -149,7 +155,7 @@ function instructionOf(value) {
  * deltas. Aborts the model call when the browser disconnects, so a cancelled
  * card stops costing tokens.
  */
-async function streamTranslation({ req, res, deps, text, kind, target, mode, source, instruction, route }) {
+async function streamTranslation({ req, res, deps, cacheKey, text, kind, target, mode, source, instruction, route }) {
   const controller = new AbortController()
   const timeoutMs = deps.config().timeoutMs ?? DEFAULT_TIMEOUT_MS
   const timer = setTimeout(() => controller.abort(new Error('dsh-translator: timeout')), timeoutMs)
@@ -159,11 +165,15 @@ async function streamTranslation({ req, res, deps, text, kind, target, mode, sou
     controller.abort(new Error('dsh-translator: client disconnected'))
   }
   req.on('close', onClose)
+  // A response 'error' means the socket died. Without a listener, an 'error' event
+  // on a stream is unhandled — and an unhandled 'error' on the host's own http
+  // server terminates the whole dsh web process, not just this card. Treated as
+  // "the browser is gone", which also stops the model call.
+  res.on('error', onClose)
 
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-store',
-    connection: 'keep-alive',
     'x-accel-buffering': 'no',
   })
   sse(res, { type: 'start', route, target })

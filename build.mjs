@@ -261,6 +261,7 @@ async function buildHost() {
   const entry = path.join(ROOT, 'src/host/index.js')
   const entryDir = path.dirname(entry)
   const cache = new Map()
+  const entrySource = await readFile(entry, 'utf8')
   await loadModule(entry, cache, entryDir)
 
   // The inner table below resolves synchronously, so a host module can never
@@ -301,15 +302,46 @@ function __require(spec) {
   return mod.exports;
 }
 const __exports = __require(${JSON.stringify(moduleId(entry, entryDir))});
-export const apply = __exports.apply;
-export const inject = __exports.inject;
-export const name = __exports.name;
-export const resolveConfig = __exports.resolveConfig;
-export const resolveRoute = __exports.resolveRoute;
-export const translateStream = __exports.translateStream;
+${hostReexports(entrySource)}
 `
   await writeFile(path.join(ROOT, 'lib/index.js'), body, 'utf8')
   console.log(`[dsh-translator] built lib/index.js (${cache.size} modules, ${(Buffer.byteLength(body, 'utf8') / 1024).toFixed(1)} KiB)`)
+}
+
+/**
+ * Re-export every public name of the host entry.
+ *
+ * This list used to be hand-written and had drifted: `PROBE_MARKER`,
+ * `injectDebugProbe` and `TRANSLATOR_GUIDANCE` existed in `src/host/index.js` but not
+ * in `lib/index.js`, which `package.json`'s `main` points at — so a consumer of the
+ * built entry saw `undefined` where the source had an export. Deriving it from the
+ * source means an export can never be forgotten again.
+ * @param source - the host entry's source text.
+ * @returns the `export const …` lines.
+ */
+function hostReexports(source) {
+  const names = new Set()
+  const patterns = [
+    // `function*` and `async function*` are generators, and the star sits between the
+    // keyword and the name: `export async function* translateStream` failed to match a
+    // `function\s+` pattern, so the derived list silently dropped it (verify-build
+    // caught the missing export in the built bundle).
+    /^export\s+(?:async\s+)?(?:function\s*\*?|const|let|var|class)\s+([A-Za-z_$][\w$]*)/gm,
+  ]
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) names.add(match[1])
+  }
+  // `export { a, b as c }` style, in case a future edit uses it.
+  for (const match of source.matchAll(/^export\s*\{([^}]*)\}/gm)) {
+    for (const part of match[1].split(',')) {
+      const alias = part.trim().split(/\s+as\s+/)
+      const name = (alias[1] ?? alias[0] ?? '').trim()
+      if (name !== '') names.add(name)
+    }
+  }
+  const stable = [...names].sort()
+  if (stable.length === 0) throw new Error('dsh-translator build: the host entry exports nothing')
+  return stable.map((name) => `export const ${name} = __exports.${name};`).join('\n')
 }
 
 /** Mirror the transformed sources into `.build-run/` for the Node smoke test. */

@@ -147,6 +147,10 @@ export function readSelection(pointer, policy = {}) {
   const viewport = viewportRect()
   const pointerLeft = Math.min(Math.max(pointer?.left ?? rect.right, 0), viewport.width)
   const pointerTop = Math.min(Math.max(pointer?.top ?? rect.bottom, 0), viewport.height)
+  // Truncate by CODE POINT, not by UTF-16 index: the cap counts code points, so a
+  // UTF-16 slice could cut an astral character (an emoji, a rare CJK extension) in
+  // half and send a lone surrogate that the host then replaces with U+FFFD.
+  const points = [...classified.text]
   return {
     action: classified.action,
     reason: classified.reason,
@@ -154,8 +158,8 @@ export function readSelection(pointer, policy = {}) {
     // one that is: "already Chinese" is wrong copy the moment the target moves.
     targetLabel: languageLabel(target),
     shortLabel: languageShortLabel(target),
-    text: classified.text.slice(0, MAX_SELECTION_CHARS),
-    truncated: classified.text.length > MAX_SELECTION_CHARS,
+    text: points.slice(0, MAX_SELECTION_CHARS).join(''),
+    truncated: points.length > MAX_SELECTION_CHARS,
     rect: { ...rect, pointerLeft, pointerTop },
     inCodeBlock: insideCodeBlock(anchor) || insideCodeBlock(focus),
     sourceLabel: insideCodeBlock(anchor) || insideCodeBlock(focus) ? '代码块' : '对话内容',

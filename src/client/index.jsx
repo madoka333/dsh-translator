@@ -24,6 +24,7 @@ import React from 'react'
 import { createRoot } from 'react-dom/client'
 
 import {
+  CODE_PLACEHOLDER,
   DEFAULT_MODE_ID,
   DEFAULT_TARGET_CODE,
   SOURCE_AUTO,
@@ -35,10 +36,12 @@ import {
   languageLabel,
   languageVerdict,
   maskCode,
+  missingSpans,
   nextPairAfterSource,
   nextPairAfterTarget,
   normalizeSelection,
   restoreCode,
+  sanitizeInstruction,
   swapPair,
 } from '../shared/select.js'
 import { provenanceFor, readChatSnapshot } from './chat.js'
@@ -427,7 +430,12 @@ export function apply(ctx) {
     for (const ref of store.list()) {
       const current = specOf(ref)
       const want = { ...current, ...patch }
-      if (want.lang === current.lang && want.mode === current.mode && want.sourceLang === current.sourceLang) continue
+      const unchanged =
+        want.lang === current.lang &&
+        want.mode === current.mode &&
+        want.sourceLang === current.sourceLang &&
+        (want.instruction ?? '') === (current.instruction ?? '')
+      if (unchanged) continue
       const detected = detectLanguage(ref.text)
       if (detected.certain && detected.code === want.lang) continue
       store.retry(ref.key, translatorFor(ref.text, ref.kind), want)
@@ -438,9 +446,25 @@ export function apply(ctx) {
   function translatorFor(text, kind) {
     return {
       chunks: (value) => chunkText(value),
-      translate: async ({ text: unit, kind: unitKind, lang, mode: unitMode, sourceLang, signal, onStart, onDelta }) => {
+      translate: async ({
+        text: unit,
+        kind: unitKind,
+        lang,
+        mode: unitMode,
+        sourceLang,
+        instruction: unitInstruction,
+        signal,
+        onStart,
+        onDelta,
+      }) => {
         const masking = (settings.getSnapshot().maskCode ?? true) ? maskCode(unit) : { text: unit, spans: [] }
-        if (masking.text.trim() === '') {
+        // Nothing but code: a unit that masks down to placeholders alone has no prose
+        // to translate, so the model must not be called at all. (The old check only
+        // caught an EMPTY masked text, which never happens: a whole-code unit masks to
+        // exactly one placeholder, and every such selection cost a pointless round
+        // trip that returned the input unchanged.)
+        const nothingToTranslate = masking.text.replaceAll(CODE_PLACEHOLDER, '').trim() === ''
+        if (masking.text.trim() === '' || nothingToTranslate) {
           // The whole unit is code: keep the original untouched.
           onDelta?.(unit)
           return unit
@@ -450,23 +474,42 @@ export function apply(ctx) {
         // two different stories about the same request.
         const gear = unitMode ?? mode()
         let whole = ''
+        let emitted = ''
+        /** Emit the RESTORED text streamed so far, as it grows. */
+        const flush = () => {
+          const restored = restoreCode(whole, masking.spans)
+          if (restored.length > emitted.length) {
+            const grown = restored.slice(emitted.length)
+            emitted = restored
+            onDelta?.(grown)
+          }
+        }
         await translate({
           text: masking.text,
           kind: unitKind ?? kind,
           lang,
           source: effectiveSource(masking.text, sourceLang),
           mode: gear,
-          instruction: gear === 'custom' ? instruction() : '',
+          instruction: gear === 'custom' ? unitInstruction ?? instruction() : '',
           signal,
           onStart,
           onDelta: (delta) => {
             whole += delta
-            onDelta?.(delta)
+            // Restore INCREMENTALLY, not with a tail slice at the end: a placeholder
+            // can sit anywhere in the answer, so "the restored text is the streamed
+            // text plus a suffix" is false — the old tail-slice version left a literal
+            // ⟪code⟫ in the card and appended the code a second time.
+            flush()
           },
         })
+        // Whatever the model failed to put back is appended rather than dropped: the
+        // user's command must not vanish from the translation (best effort — the card
+        // still shows the full original above it).
+        const missing = missingSpans(whole, masking.spans)
         const restored = restoreCode(whole, masking.spans)
-        if (restored.length > whole.length) onDelta?.(restored.slice(whole.length))
-        return restored
+        const final = missing.length === 0 ? restored : `${restored}\n\n${missing.join('\n')}`
+        if (final.length > emitted.length) onDelta?.(final.slice(emitted.length))
+        return final
       },
     }
   }
@@ -497,6 +540,7 @@ export function apply(ctx) {
           lang: live.target,
           mode: mode(),
           sourceLang: live.source,
+          instruction: mode() === 'custom' ? instruction() : '',
           sourceLabel: label,
         },
         translatorFor(classified.text, meta.kind ?? 'selection'),
@@ -529,6 +573,7 @@ export function apply(ctx) {
           lang: live.target,
           mode: mode(),
           sourceLang: live.source,
+          instruction: mode() === 'custom' ? instruction() : '',
           sourceLabel: '手动输入',
         },
         translatorFor(classified.text, 'selection'),
@@ -559,6 +604,18 @@ export function apply(ctx) {
       const chosen = isKnownMode(id) ? id : DEFAULT_MODE_ID
       settings.update({ mode: chosen })
       retranslateAll({ mode: chosen })
+    },
+    /**
+     * Edit the custom gear's requirement.
+     *
+     * Part of the SPEC, not just of the settings: the answer depends on it, so
+     * editing it must invalidate the cached answer AND re-run the cards that were
+     * translated under the old wording.
+     */
+    setCustomInstruction: (text) => {
+      const next = String(text ?? '')
+      settings.update({ customInstruction: next })
+      if (mode() === 'custom') retranslateAll({ instruction: sanitizeInstruction(next) })
     },
     /** Exchange the two sides (or pin the source and aim at what was detected). */
     swapLanguages: () => {
@@ -775,7 +832,7 @@ export function apply(ctx) {
   // --- Settings → General row (soft) ---------------------------------------
   ctx.inject(SETTINGS_SERVICES, (slotCtx) => {
     slotCtx.effect(() => {
-      const SettingsHost = () => React.createElement(SettingsRow, { store: settings })
+      const SettingsHost = () => React.createElement(SettingsRow, { store: settings, runtime })
       try {
         return slotCtx.slots.inject(SETTINGS_SLOT, () =>
           slotCtx.slots.register({ name: SETTINGS_SLOT, id: 'translator', order: 60 }, SettingsHost),
@@ -818,14 +875,12 @@ export function apply(ctx) {
           return `THREW ${error instanceof Error ? error.message : String(error)}`
         }
       })()}`,
-      `pane render   : ${(() => {
-        try {
-          const tree = TranslatePane({ store, runtime })
-          return tree === null ? 'null' : `ok <${tree.type?.name ?? tree.type}>`
-        } catch (error) {
-          return `THREW ${renderFailureLog()[0] ?? String(error)}`
-        }
-      })()}`,
+      // Do NOT call the pane component here to "check" it. This is `apply`, not a
+      // render, so invoking it runs React hooks outside a render pass: with real
+      // React that throws ("Invalid hook call"), and the report then claims the
+      // healthiest path is broken. The unit harness's stub hooks hid that. Wiring is
+      // what can be checked from here.
+      `pane wiring   : component=${typeof TranslatePane === 'function'} store=${typeof store?.add === 'function'} runtime=${typeof runtime?.addRef === 'function'}`,
       `render errors : ${errors.length === 0 ? '（无）' : errors.join(' | ')}`,
       `hint          : 空白面板 = 座位条目"退位"（组件渲染抛错）；兜底文案 = 座位 key 不匹配`,
     ]

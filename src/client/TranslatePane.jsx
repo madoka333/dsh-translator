@@ -9,7 +9,7 @@
  * @module dsh-translator/client/TranslatePane
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import {
   AUTO_DETECT_LABEL,
@@ -23,6 +23,7 @@ import {
   modeById,
   modeLabel,
   normalizeSourceCode,
+  targetCodeOf,
 } from '../shared/select.js'
 import { CLS } from './styles.js'
 import { readDraft, writeDraft } from './stores.js'
@@ -31,10 +32,7 @@ import { readDraft, writeDraft } from './stores.js'
 export function pairOf(runtime) {
   return {
     source: normalizeSourceCode(runtime?.sourceLanguage),
-    target: (() => {
-      const code = normalizeSourceCode(runtime?.targetLanguage)
-      return code === SOURCE_AUTO ? DEFAULT_TARGET_CODE : code
-    })(),
+    target: targetCodeOf({ target: runtime?.targetLanguage }),
   }
 }
 
@@ -227,18 +225,22 @@ async function copyText(text) {
     await navigator.clipboard.writeText(text)
     return true
   } catch {
+    // The fallback has to clean up on EVERY path: when `execCommand` throws (a
+    // blocked clipboard, a non-secure context, a permission prompt), the old code
+    // skipped the `removeChild` and left an invisible fixed-position textarea — and
+    // it also swallowed the document selection — behind on every failed copy.
+    const area = document.createElement('textarea')
     try {
-      const area = document.createElement('textarea')
       area.value = text
       area.style.position = 'fixed'
       area.style.opacity = '0'
       document.body.appendChild(area)
       area.select()
-      const ok = document.execCommand('copy')
-      document.body.removeChild(area)
-      return ok
+      return document.execCommand('copy')
     } catch {
       return false
+    } finally {
+      area.remove?.()
     }
   }
 }
@@ -401,7 +403,12 @@ function Composer({ runtime, sessionKey, onNotice }) {
       // An Enter that ends an IME candidate window belongs to the input method, not
       // to us: without this guard, typing Chinese and picking a candidate would
       // submit half a word.
-      if (composing || event.nativeEvent?.isComposing === true) return
+      // An Enter that ends an IME candidate window belongs to the input method, not
+      // to us: without this guard, typing Chinese and picking a candidate would
+      // submit half a word. `isComposing` is not enough on its own — several IMEs
+      // (Safari, and Windows IMEs in some browsers) clear it before the confirming
+      // Enter arrives and report keyCode 229 instead.
+      if (composing || event.nativeEvent?.isComposing === true || event.nativeEvent?.keyCode === 229) return
       if (event.shiftKey) return
       if (event.ctrlKey || event.metaKey || event.altKey) return
       event.preventDefault()
@@ -483,7 +490,13 @@ export function TranslatePane({ store, runtime, sessionKey }) {
   // deliberately not in the snapshot read itself: a store whose `setSession`
   // throws must not take the pane's first render down with it. A store without
   // `setSession` (the test harness, a foreign host) is simply left alone.
-  useEffect(() => {
+  //
+  // LAYOUT effect, not a passive one: a passive effect runs after the browser has
+  // painted, so the first paint after switching Sessions showed the PREVIOUS
+  // Session's cards (the render above already read the old namespace) and only then
+  // corrected itself. Synchronous-before-paint is exactly the fix, and the switch is
+  // a store commit, not DOM work.
+  useLayoutEffect(() => {
     if (typeof sessionKey !== 'string' || sessionKey === '') return
     try {
       store?.setSession?.(sessionKey)
@@ -495,10 +508,23 @@ export function TranslatePane({ store, runtime, sessionKey }) {
 
   const refs = snapshot.refs
 
+  /** The notice's dismissal timer, so a second notice replaces it instead of racing it. */
+  const noticeTimer = useRef(null)
   const flash = useCallback((message) => {
     setNotice(message)
-    setTimeout(() => setNotice(''), 1800)
+    if (noticeTimer.current !== null) clearTimeout(noticeTimer.current)
+    noticeTimer.current = setTimeout(() => {
+      noticeTimer.current = null
+      setNotice('')
+    }, 1800)
   }, [])
+  // A pending timer that fires after unmount is a setState on a dead component.
+  useEffect(
+    () => () => {
+      if (noticeTimer.current !== null) clearTimeout(noticeTimer.current)
+    },
+    [],
+  )
 
   const handleCopy = useCallback(
     async (text) => {
@@ -514,19 +540,24 @@ export function TranslatePane({ store, runtime, sessionKey }) {
       setDragover(false)
       const text = event.dataTransfer?.getData('text/plain') ?? ''
       if (text.trim() === '') return
-      runtime.addRef(text, { kind: 'selection', sourceLabel: '拖拽引用' })
+      // `addRef` returns null when the text is not worth translating (already the
+      // target language, too short, blank). Ignoring that made a refused drop look
+      // like a drop zone that does not work — the selection path at least logs it.
+      const key = runtime.addRef(text, { kind: 'selection', sourceLabel: '拖拽引用' })
+      if (key === null) flash('这段内容无需翻译（已经是目标语言或太短）')
     },
-    [runtime],
+    [flash, runtime],
   )
 
   // A failure recorded during the hook phase is rendered here, before anything
   // else, so the user sees why the pane is not showing their references.
   if (readFailure !== null) return failurePanel(readFailure)
 
-  // Everything past the hooks is guarded: a failure here is recorded and rendered
-  // as a readable panel, never thrown out of the component. Throwing would abdicate
-  // the whole seat and leave the column showing an empty pane with only a
-  // `data-slot-error` marker in the DOM — invisible to the user.
+  // Everything the pane BUILDS is guarded here: a failure while assembling the tree
+  // is recorded and rendered as a readable panel instead of thrown out of the
+  // component. (A throw from inside a child's own render — a card, the composer — is
+  // React's to handle and is NOT caught by this try/catch; the card therefore reads
+  // its fields defensively rather than relying on it.)
   try {
     // The composer is mounted with `key={sessionKey}` on purpose: switching Sessions
     // remounts it, so loading the incoming Session's draft is a `useState`
@@ -569,6 +600,16 @@ function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, hand
   const gear = modeIdOf(runtime)
   const swapHint = swapHintOf(pair, runtime?.detected ?? null)
   const gearHint = modeHintOf(runtime)
+  // The drag highlight is cleared on a `dragleave` that really leaves the pane:
+  // `dragleave` also fires when the pointer crosses onto one of the pane's own
+  // children, which used to make the highlight flicker while dragging over the list.
+  // (Kept out of the JSX attribute list on purpose — this build's JSX transform does
+  // not support comments between attributes.)
+  const onDragLeave = (event) => {
+    const next = event.relatedTarget
+    if (next !== null && next !== undefined && event.currentTarget?.contains?.(next) === true) return
+    setDragover(false)
+  }
   return (
     <div
       className={`${CLS}-pane`}
@@ -578,7 +619,7 @@ function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, hand
         event.preventDefault()
         setDragover(true)
       }}
-      onDragLeave={() => setDragover(false)}
+      onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
       <div className={`${CLS}-bar`}>
@@ -640,9 +681,6 @@ function renderPane({ refs, runtime, notice, dragover, setDragover, onDrop, hand
           </select>
         </span>
         <span className={`${CLS}-spacer`} />
-        <span className={`${CLS}-beta`} title="dsh-translator beta 分支：底部输入框">
-          beta
-        </span>
         <span className={`${CLS}-count`}>{notice !== '' ? notice : `${refs.length} 条引用`}</span>
         <button type="button" onClick={() => runtime.clear()} disabled={refs.length === 0}>
           清空

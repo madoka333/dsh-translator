@@ -78,6 +78,12 @@ export async function declaredBindings() {
     throw new Error(`unexpected external require: ${specifier}`)
   })
   const host = await import(new URL('../lib/index.js', import.meta.url).href)
+  // `dsh.client.inject` is a CLIENT BUNDLE LOAD-ORDER dependency, not a service:
+  // dsh awaits each named package before this plugin's factory runs, and a package
+  // that is missing (or that failed) fails the consumer with `"... not loaded because
+  // dependency ... failed"` — the plugin, not the app, but still a silent dependency
+  // that nothing else in this repo checked.
+  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
   bindingsCache = {
     services: [
       ...client.SIDEBAR_SERVICES,
@@ -86,6 +92,7 @@ export async function declaredBindings() {
       ...host.inject,
     ].filter((name, index, all) => all.indexOf(name) === index),
     slots: [...client.SLOT_SEATS],
+    bundles: Array.isArray(pkg?.dsh?.client?.inject) ? [...pkg.dsh.client.inject] : [],
   }
   return bindingsCache
 }
@@ -162,6 +169,14 @@ export async function runCheck(roots = defaultRoots()) {
   const rows = []
   for (const name of bindings.services) rows.push({ kind: 'service', name, found: await findName(name, files) })
   for (const name of bindings.slots) rows.push({ kind: 'slot', name, found: await findName(name, files) })
+  // A bundle dependency is checked by EXISTENCE, not by a quoted mention: what dsh
+  // needs is the package directory on disk. `@scope/name` lives one level down from
+  // the `@scope` root this tool scans.
+  for (const name of bindings.bundles ?? []) {
+    const short = name.includes('/') ? name.slice(name.indexOf('/') + 1) : name
+    const hit = roots.map((root) => join(root, short)).find((candidate) => existsSync(candidate))
+    rows.push({ kind: 'bundle', name, found: hit })
+  }
   return { roots: existing, scans: files.length, rows, missing: rows.filter((row) => row.found === undefined) }
 }
 

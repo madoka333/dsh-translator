@@ -96,9 +96,10 @@ ${TOKENS}
 .${CLS}-count{
   color:var(--${CLS}-faint);font-size:11px;white-space:nowrap;
   border:1px solid var(--${CLS}-line);border-radius:999px;padding:1px 8px}
-.${CLS}-beta{
-  color:var(--${CLS}-faint);border:1px solid var(--${CLS}-line);border-radius:999px;
-  padding:1px 6px;font-size:9px;letter-spacing:.08em;text-transform:uppercase}
+/* The beta badge lived here while the branch was experimental; 0.2.0 shipped it, so
+   the badge and its rule are gone together. (Note for the next editor: no backticks
+   anywhere below — the whole sheet is one template literal, and a backtick in a
+   comment terminates it early and takes the whole Web GUI down with it.) */
 
 /* ---- reference list ------------------------------------------------------ */
 .${CLS}-list{

@@ -84,6 +84,18 @@ assert.match(
 const host = await import(new URL('../lib/index.js', import.meta.url).href)
 assert.equal(host.name, 'dsh-translator')
 assert.deepEqual(host.inject, ['webServer', 'llm', 'systemPrompt'])
+// Every public name of the SOURCE entry must exist in the BUILT entry, which is what
+// `package.json`'s `main` points at. That list used to be hand-written and had lost
+// three names (PROBE_MARKER, injectDebugProbe, TRANSLATOR_GUIDANCE), so a consumer of
+// the built entry saw `undefined` where the source had an export.
+const hostSource = await readFile(new URL('../src/host/index.js', import.meta.url), 'utf8')
+const declaredHostExports = [
+  ...hostSource.matchAll(/^export\s+(?:async\s+)?(?:function|const|let|var|class)\s+([A-Za-z_$][\w$]*)/gm),
+].map((match) => match[1])
+assert.ok(declaredHostExports.length >= 8, 'the host entry exports its public surface')
+for (const name of declaredHostExports) {
+  assert.ok(name in host, `the built host bundle must re-export ${name}`)
+}
 for (const name of ['apply', 'resolveConfig', 'resolveRoute', 'translateStream']) {
   assert.equal(typeof host[name], 'function', `host must export ${name}`)
 }
@@ -102,6 +114,7 @@ assert.equal(defaults.timeoutMs, 30_000)
 assert.equal(defaults.maxOutputTokens, 4096)
 assert.equal(defaults.cacheSize, 500)
 assert.equal(defaults.verbose, false)
+assert.equal(defaults.reasoningEffort, undefined, 'reasoning effort is not silently implied by a logging flag')
 
 const override = host.resolveConfig({ targetLanguage: 'ja', timeoutMs: 5_000, verbose: true })
 assert.equal(override.targetLanguage, 'ja')

@@ -33,8 +33,19 @@ const SECTION_ORDER = 216
 /** Route prefix. */
 const PREFIX = '/dsh-translator'
 
-/** Model chosen when neither the config nor the session selection names one. */
-const FALLBACK_MODEL = 'deepseek-v4-flash'
+/**
+ * Model chosen when neither the config nor the session selection names one.
+ *
+ * Must be a model the installed adapter actually serves: the route resolver
+ * checks candidates against the live catalog, so a name that does not exist is
+ * simply skipped and the plugin ends up with no route at all. `deepseek-flash`
+ * is what `@deepseek-ai/dsh-llm-deepseek` 0.1.7-rc.2 advertises (alongside
+ * `deepseek-v4-pro`); `deepseek-v4-flash` does not exist there.
+ */
+const FALLBACK_MODEL = 'deepseek-flash'
+
+/** Provider the fallback model belongs to. */
+const FALLBACK_PROVIDER = 'deepseek-official'
 
 /** Model-facing note: the model must not change its own language because of this plugin. */
 export const TRANSLATOR_GUIDANCE =
@@ -52,6 +63,11 @@ const CONFIG_DEFAULTS = {
   timeoutMs: 30_000,
   maxOutputTokens: 4096,
   cacheSize: 500,
+  // Reasoning effort is a REAL model knob, so it gets its own key and defaults to
+  // "whatever the adapter decides": `verbose` is a logging switch, and letting it
+  // silently change model behaviour (the old coupling) meant a diagnostics flag
+  // could also speed up or break translations.
+  reasoningEffort: undefined,
   verbose: false,
 }
 
@@ -115,6 +131,9 @@ export function resolveConfig(value = {}) {
       `dsh-translator: config.customInstruction must be a string of at most ${MAX_INSTRUCTION_CHARS} characters`,
     )
   }
+  if (out.reasoningEffort !== undefined && (typeof out.reasoningEffort !== 'string' || out.reasoningEffort === '')) {
+    throw new Error('dsh-translator: config.reasoningEffort must be a non-empty string when supplied')
+  }
   assertIntInRange('timeoutMs', out.timeoutMs, 1000, 600_000)
   assertIntInRange('maxOutputTokens', out.maxOutputTokens, 64, 64_000)
   assertIntInRange('cacheSize', out.cacheSize, 0, 10_000)
@@ -130,20 +149,45 @@ function assertIntInRange(name, value, min, max) {
 }
 
 /**
+ * `resolveConfig`, but a rejected config degrades to the defaults instead of
+ * taking the Web GUI down with the plugin (see {@link apply}).
+ * @param config - untrusted deployment config.
+ * @returns a validated config, always.
+ */
+export function resolveConfigOrWarn(config = {}, warn = (line) => console.warn(line)) {
+  try {
+    return resolveConfig(config)
+  } catch (error) {
+    warn(
+      `[dsh-translator] 部署配置被拒绝，已改用默认值（这个插件不会因为配置错误把 Web UI 拖下水）：${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
+    return resolveConfig({})
+  }
+}
+
+/**
  * Mount the routes and the prompt section.
  *
  * There is deliberately no `Config` export: the profile loader only validates
  * plugins that expose one, and it does so through the standard-schema
  * `~standard` contract that a hand-rolled schema cannot satisfy — a mismatch
- * there fails the entire plugin tree, not just this plugin. Validating here
- * instead keeps a bad deployment config contained to dsh-translator, and the
- * loud throw still surfaces at boot.
+ * there fails the entire plugin tree, not just this plugin.
+ *
+ * **A throw from `apply` is NOT contained.** Measured against the installed
+ * 0.1.7-rc.2 (`dsh-app-boot`): an `apply` that throws fails the whole plugin tree
+ * and leaves the Web GUI on the boot screen. So a typo in a deployment config
+ * must not throw: `resolveConfig` still validates (and is still directly
+ * assertable), but here a rejected config is logged LOUDLY and the plugin
+ * continues on the defaults. Losing a config value is recoverable; losing the
+ * GUI is not.
  *
  * @param ctx - host context carrying `webServer`, `llm`, `systemPrompt`.
  * @param config - untrusted deployment config, passed through verbatim.
  */
 export function apply(ctx, config = {}) {
-  const resolved = resolveConfig(config)
+  const resolved = resolveConfigOrWarn(config)
 
   const cache = new LruCache(resolved.cacheSize)
   const llm = () => ctx.get('llm')
@@ -266,14 +310,22 @@ const DEBUG_PROBE_SCRIPT = `
 /**
  * Resolve the provider/model route for one call, in priority order:
  * per-request override → explicit config → the Session's/default selection →
- * the cheapest known model. Every candidate is checked against the adapter's
- * registry, so a stale selection degrades instead of failing the request.
+ * a model the registry actually serves. Every candidate is checked against the
+ * adapter's catalog, so a stale selection degrades instead of failing the request.
+ *
+ * ASYNC because `ctx.llm.listModels` is async in 0.1.7-rc.2 (`Promise<LlmModelInfo[]>`).
+ * Treating it as an array silently disabled every catalog check: `Array.isArray(promise)`
+ * is false, the code fell through to `listProviders()`, and any candidate whose
+ * PROVIDER existed was accepted — including models the adapter cannot serve. The
+ * symptom is a translation that fails on a model name the session no longer has,
+ * instead of quietly stepping down to a served one.
+ *
  * @param ctx - host context.
  * @param config - resolved plugin config.
  * @param preferred - `{provider, model}` from the browser, when it read one.
  * @returns a single-element array with the route, or an empty array when nothing resolves.
  */
-export function resolveRoute(ctx, config, preferred) {
+export async function resolveRoute(ctx, config, preferred) {
   const candidates = []
   if (isRoute(preferred)) candidates.push({ provider: preferred.provider, model: preferred.model })
   if (config.provider !== undefined && config.model !== undefined) {
@@ -281,9 +333,15 @@ export function resolveRoute(ctx, config, preferred) {
   }
   const selection = defaultSelection(ctx)
   if (isRoute(selection)) candidates.push({ provider: selection.provider, model: selection.model })
-  candidates.push({ provider: 'deepseek-official', model: FALLBACK_MODEL })
+  candidates.push({ provider: FALLBACK_PROVIDER, model: FALLBACK_MODEL })
+  // Last resort: the first model the provider actually advertises. This is what
+  // keeps the plugin working when the hard-coded fallback is renamed by an
+  // upgrade — the candidate above is checked against the live catalog too.
+  const catalog = await listModelsOf(ctx, FALLBACK_PROVIDER)
+  if (catalog.length > 0) candidates.push({ provider: FALLBACK_PROVIDER, model: catalog[0] })
+
   for (const candidate of candidates) {
-    if (supportsModel(ctx, candidate)) return [candidate]
+    if (await supportsModel(ctx, candidate)) return [candidate]
   }
   return []
 }
@@ -309,20 +367,37 @@ function defaultSelection(ctx) {
   }
 }
 
-/** Ask the adapter registry whether it serves one exact route. */
-function supportsModel(ctx, route) {
+/**
+ * Ask the adapter registry whether it serves one exact route.
+ *
+ * `listModels` is async (0.1.7-rc.2) and can REJECT for a provider the registry
+ * does not know, so it is awaited inside a try/catch: a rejection means "no
+ * catalog", not "the call is doomed".
+ */
+async function supportsModel(ctx, route) {
+  const service = llm$of(ctx)
+  if (service === undefined) return false
+  const models = await listModelsOf(ctx, route.provider)
+  if (models.length > 0) return models.some((id) => id === route.model)
+  // No catalog (a gateway that declares nothing): trust the provider.
   try {
-    const service = llm$of(ctx)
-    if (service === undefined) return false
-    const models = service.listModels(route.provider)
-    if (Array.isArray(models) && models.length > 0) {
-      return models.some((entry) => entry?.id === route.model)
-    }
-    // No catalog (a gateway that declares nothing): trust the route.
     return service.listProviders().some((entry) => entry?.id === route.provider)
   } catch {
     // Registry unavailable — let the call itself produce the loud error.
     return true
+  }
+}
+
+/** Model ids one provider advertises, or an empty array when it cannot be read. */
+async function listModelsOf(ctx, provider) {
+  const service = llm$of(ctx)
+  if (service === undefined || typeof service.listModels !== 'function') return []
+  try {
+    const models = await service.listModels(provider)
+    if (!Array.isArray(models)) return []
+    return models.map((entry) => (typeof entry?.id === 'string' ? entry.id : '')).filter((id) => id !== '')
+  } catch {
+    return []
   }
 }
 
@@ -368,7 +443,7 @@ export async function* translateStream(ctx, request, config, log = () => {}) {
       maxTokens: request.maxTokens,
       signal: request.signal,
     }
-    if (config.verbose) options.reasoningEffort = 'off'
+    if (config.reasoningEffort !== undefined) options.reasoningEffort = config.reasoningEffort
     for await (const chunk of service.stream(options)) {
       if (chunk?.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text !== '') {
         collected += chunk.text
